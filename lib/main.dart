@@ -1,12 +1,9 @@
-// BDUI Builder - Stage 2.4 Final (single-file)
-// Features:
-// - Sidebar tree (all nodes)
-// - Drill-down visual editor (immediate children only)
-// - Inspector with View (syntax-highlighted) and JSON editor tabs
-// - Live two-way sync (debounced)
-// - Add / Duplicate / Move Up / Move Down / Delete via popup menu (⋮)
-// - Undo / Redo history
-// - Import / Export / Clipboard / Download on web
+// BDUI Builder - Stage 2.5 Final (single-file)
+// Stage 2.5 changes:
+// - JSON editor: Save button in header, Undo/Redo local history (limit 50), apply on focus loss or Save
+// - Inspector View syncs with model; JSON editor reflects model unless user has unsaved edits
+// - Tooltips added to relevant icons
+// - Replaced simulated stubs with real binding logic
 
 import 'dart:async';
 import 'dart:convert';
@@ -26,7 +23,7 @@ class BDUIApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'BDUI Builder - Stage2.4 Final',
+      title: 'BDUI Builder - Stage2.5 Final',
       theme: ThemeData(useMaterial3: true),
       home: const BDUIStage2Page(),
       debugShowCheckedModeBanner: false,
@@ -138,14 +135,22 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
   String? _editorPath; // node currently shown in visual editor
 
   final TextEditingController _rawEditorController = TextEditingController();
+  final FocusNode _rawEditorFocusNode = FocusNode();
   final Map<String, TextEditingController> _valueControllers = {};
   final Map<String, Timer?> _debounceTimers = {};
   String _selectedJsonCache = '';
 
-  // undo/redo stacks
+  // global undo/redo
   final List<String> _undoStack = [];
   final List<String> _redoStack = [];
   static const int _kHistoryLimit = 100;
+
+  // json editor local history
+  final List<String> _jsonEditHistory = [];
+  int _jsonEditIndex = -1;
+  Timer? _jsonHistoryDebounce;
+  static const int _kJsonHistoryLimit = 50;
+  bool _rawEditorDirty = false; // true when user edited JSON but not saved
 
   final Map<String, GlobalKey> _tileKeys = {};
   final Map<String, GlobalKey> _titleKeys = {};
@@ -161,6 +166,23 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
   void initState() {
     super.initState();
     _inspectorTabController = TabController(length: 2, vsync: this);
+
+    _rawEditorController.addListener(() {
+      // if change triggered programmatically we don't mark dirty here
+      if (!_rawEditorFocusNode.hasFocus) return;
+      _rawEditorDirty = true;
+      _jsonHistoryDebounce?.cancel();
+      _jsonHistoryDebounce = Timer(const Duration(milliseconds: 700), () {
+        _jsonPushHistory(_rawEditorController.text);
+      });
+    });
+
+    _rawEditorFocusNode.addListener(() {
+      if (!_rawEditorFocusNode.hasFocus) {
+        // focus lost -> attempt save
+        _saveRawEditorIfDirty();
+      }
+    });
   }
 
   @override
@@ -171,9 +193,11 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     _valueControllers.clear();
     _debounceTimers.clear();
     _rawEditorController.dispose();
+    _rawEditorFocusNode.dispose();
     _inspectorHController.dispose();
     _inspectorVController.dispose();
     _sidebarScroll.dispose();
+    _jsonHistoryDebounce?.cancel();
     super.dispose();
   }
 
@@ -230,6 +254,48 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     }
   }
 
+  // ---------- json editor local history ----------
+  void _jsonPushHistory(String txt) {
+    if (_jsonEditIndex >= 0 &&
+        _jsonEditIndex < _jsonEditHistory.length &&
+        _jsonEditHistory[_jsonEditIndex] == txt)
+      return;
+    // drop everything after current index
+    if (_jsonEditIndex < _jsonEditHistory.length - 1) {
+      _jsonEditHistory.removeRange(_jsonEditIndex + 1, _jsonEditHistory.length);
+    }
+    _jsonEditHistory.add(txt);
+    if (_jsonEditHistory.length > _kJsonHistoryLimit)
+      _jsonEditHistory.removeAt(0);
+    _jsonEditIndex = _jsonEditHistory.length - 1;
+  }
+
+  void _jsonUndo() {
+    if (_jsonEditIndex <= 0) return;
+    _jsonEditIndex--;
+    final txt = _jsonEditHistory[_jsonEditIndex];
+    _setRawEditorTextProgrammatic(txt);
+  }
+
+  void _jsonRedo() {
+    if (_jsonEditIndex < 0 || _jsonEditIndex >= _jsonEditHistory.length - 1)
+      return;
+    _jsonEditIndex++;
+    final txt = _jsonEditHistory[_jsonEditIndex];
+    _setRawEditorTextProgrammatic(txt);
+  }
+
+  void _setRawEditorTextProgrammatic(String txt) {
+    // set text without marking dirty and without adding to json history
+    final hadFocus = _rawEditorFocusNode.hasFocus;
+    _rawEditorFocusNode.canRequestFocus = false;
+    _rawEditorController.text = txt;
+    _rawEditorDirty = false;
+    // restore focus ability
+    _rawEditorFocusNode.canRequestFocus = true;
+    if (hadFocus) _rawEditorFocusNode.requestFocus();
+  }
+
   // ---------- IO ----------
   void _loadJsonString(String txt, {bool pushHistory = true}) {
     try {
@@ -246,6 +312,9 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           _tileKeys.clear();
           _titleKeys.clear();
           _selectedJsonCache = '';
+          _jsonEditHistory.clear();
+          _jsonEditIndex = -1;
+          _rawEditorDirty = false;
         });
         ScaffoldMessenger.of(
           context,
@@ -341,10 +410,16 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       _selectedPath = path;
       _selectedValue = val;
       _editorPath = path;
-      _rawEditorController.text = const JsonEncoder.withIndent(
-        '  ',
-      ).convert(val);
-      _selectedJsonCache = _rawEditorController.text;
+      // update raw editor programmatically only if user has not unsaved edits
+      final newText = const JsonEncoder.withIndent('  ').convert(val);
+      if (!_rawEditorDirty) {
+        _setRawEditorTextProgrammatic(newText);
+        // reset local json history
+        _jsonEditHistory.clear();
+        _jsonEditHistory.add(newText);
+        _jsonEditIndex = 0;
+      }
+      _selectedJsonCache = newText;
     });
 
     if (!ensureCenter) return;
@@ -576,23 +651,19 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               ),
               Row(
                 children: [
-                  IconButton(
-                    onPressed: () => _addMapKeyDialog(path),
-                    icon: const Icon(Icons.add),
+                  Tooltip(
+                    message: 'Add key to map',
+                    child: IconButton(
+                      onPressed: () => _addMapKeyDialog(path),
+                      icon: const Icon(Icons.add),
+                    ),
                   ),
-                  PopupMenuButton<String>(
-                    icon: const Icon(Icons.more_vert),
-                    onSelected: (v) {
-                      if (v == 'undo')
-                        _undo();
-                      else if (v == 'redo')
-                        _redo();
-                    },
-                    itemBuilder:
-                        (ctx) => const [
-                          PopupMenuItem(value: 'undo', child: Text('Undo')),
-                          PopupMenuItem(value: 'redo', child: Text('Redo')),
-                        ],
+                  Tooltip(
+                    message: 'Delete this node',
+                    child: IconButton(
+                      onPressed: () => _deleteNodeConfirm(path),
+                      icon: const Icon(Icons.delete),
+                    ),
                   ),
                 ],
               ),
@@ -628,23 +699,19 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               ),
               Row(
                 children: [
-                  IconButton(
-                    onPressed: () => _addListItemDialog(path),
-                    icon: const Icon(Icons.add),
+                  Tooltip(
+                    message: 'Add item to list',
+                    child: IconButton(
+                      onPressed: () => _addListItemDialog(path),
+                      icon: const Icon(Icons.add),
+                    ),
                   ),
-                  PopupMenuButton<String>(
-                    icon: const Icon(Icons.more_vert),
-                    onSelected: (v) {
-                      if (v == 'undo')
-                        _undo();
-                      else if (v == 'redo')
-                        _redo();
-                    },
-                    itemBuilder:
-                        (ctx) => const [
-                          PopupMenuItem(value: 'undo', child: Text('Undo')),
-                          PopupMenuItem(value: 'redo', child: Text('Redo')),
-                        ],
+                  Tooltip(
+                    message: 'Delete this node',
+                    child: IconButton(
+                      onPressed: () => _deleteNodeConfirm(path),
+                      icon: const Icon(Icons.delete),
+                    ),
                   ),
                 ],
               ),
@@ -692,7 +759,6 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     String key,
     int index,
   ) {
-    // Primitive types
     if (value is String ||
         value is int ||
         value is double ||
@@ -707,26 +773,34 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               Expanded(child: Text(label)),
               const SizedBox(width: 12),
               Expanded(child: _buildEditorForPrimitive(childPath, value)),
-              PopupMenuButton<String>(
-                icon: const Icon(Icons.more_vert),
-                onSelected:
-                    (v) =>
-                        _handleNodeMenuMap(parentMap, key, index, childPath, v),
-                itemBuilder:
-                    (ctx) => const [
-                      PopupMenuItem(
-                        value: 'duplicate',
-                        child: Text('Duplicate'),
+              Tooltip(
+                message: 'More actions',
+                child: PopupMenuButton<String>(
+                  icon: const Icon(Icons.more_vert),
+                  onSelected:
+                      (v) => _handleNodeMenuMap(
+                        parentMap,
+                        key,
+                        index,
+                        childPath,
+                        v,
                       ),
-                      PopupMenuItem(value: 'rename', child: Text('Rename')),
-                      PopupMenuItem(
-                        value: 'delete',
-                        child: Text(
-                          'Delete',
-                          style: TextStyle(color: Colors.red),
+                  itemBuilder:
+                      (ctx) => const [
+                        PopupMenuItem(
+                          value: 'duplicate',
+                          child: Text('Duplicate'),
                         ),
-                      ),
-                    ],
+                        PopupMenuItem(value: 'rename', child: Text('Rename')),
+                        PopupMenuItem(
+                          value: 'delete',
+                          child: Text(
+                            'Delete',
+                            style: TextStyle(color: Colors.red),
+                          ),
+                        ),
+                      ],
+                ),
               ),
             ],
           ),
@@ -734,7 +808,6 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       );
     }
 
-    // Complex types (Map or List)
     final subtitle =
         value is Map
             ? 'Map (${(value as Map).length} keys)'
@@ -745,20 +818,23 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       child: ListTile(
         title: Text(label),
         subtitle: Text(subtitle),
-        trailing: PopupMenuButton<String>(
-          icon: const Icon(Icons.more_vert),
-          onSelected:
-              (v) => _handleNodeMenuMap(parentMap, key, index, childPath, v),
-          itemBuilder:
-              (ctx) => const [
-                PopupMenuItem(value: 'open', child: Text('Open')),
-                PopupMenuItem(value: 'duplicate', child: Text('Duplicate')),
-                PopupMenuItem(value: 'rename', child: Text('Rename')),
-                PopupMenuItem(
-                  value: 'delete',
-                  child: Text('Delete', style: TextStyle(color: Colors.red)),
-                ),
-              ],
+        trailing: Tooltip(
+          message: 'More actions',
+          child: PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert),
+            onSelected:
+                (v) => _handleNodeMenuMap(parentMap, key, index, childPath, v),
+            itemBuilder:
+                (ctx) => const [
+                  PopupMenuItem(value: 'open', child: Text('Open')),
+                  PopupMenuItem(value: 'duplicate', child: Text('Duplicate')),
+                  PopupMenuItem(value: 'rename', child: Text('Rename')),
+                  PopupMenuItem(
+                    value: 'delete',
+                    child: Text('Delete', style: TextStyle(color: Colors.red)),
+                  ),
+                ],
+          ),
         ),
       ),
     );
@@ -771,7 +847,6 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     List parentList,
     int idx,
   ) {
-    // Primitive values
     if (value is String ||
         value is int ||
         value is double ||
@@ -786,29 +861,32 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               Expanded(child: Text(label)),
               const SizedBox(width: 12),
               Expanded(child: _buildEditorForPrimitive(childPath, value)),
-              PopupMenuButton<String>(
-                icon: const Icon(Icons.more_vert),
-                onSelected:
-                    (v) => _handleNodeMenuList(parentList, idx, childPath, v),
-                itemBuilder:
-                    (ctx) => const [
-                      PopupMenuItem(
-                        value: 'duplicate',
-                        child: Text('Duplicate'),
-                      ),
-                      PopupMenuItem(value: 'moveUp', child: Text('Move Up')),
-                      PopupMenuItem(
-                        value: 'moveDown',
-                        child: Text('Move Down'),
-                      ),
-                      PopupMenuItem(
-                        value: 'delete',
-                        child: Text(
-                          'Delete',
-                          style: TextStyle(color: Colors.red),
+              Tooltip(
+                message: 'More actions',
+                child: PopupMenuButton<String>(
+                  icon: const Icon(Icons.more_vert),
+                  onSelected:
+                      (v) => _handleNodeMenuList(parentList, idx, childPath, v),
+                  itemBuilder:
+                      (ctx) => const [
+                        PopupMenuItem(
+                          value: 'duplicate',
+                          child: Text('Duplicate'),
                         ),
-                      ),
-                    ],
+                        PopupMenuItem(value: 'moveUp', child: Text('Move Up')),
+                        PopupMenuItem(
+                          value: 'moveDown',
+                          child: Text('Move Down'),
+                        ),
+                        PopupMenuItem(
+                          value: 'delete',
+                          child: Text(
+                            'Delete',
+                            style: TextStyle(color: Colors.red),
+                          ),
+                        ),
+                      ],
+                ),
               ),
             ],
           ),
@@ -816,31 +894,33 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       );
     }
 
-    // Non-primitive (Map or List)
     final subtitle =
         value is Map
             ? 'Map (${(value as Map).length} keys)'
             : 'List (${(value as List).length} items)';
-
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 6),
       child: ListTile(
         title: Text(label),
         subtitle: Text(subtitle),
-        trailing: PopupMenuButton<String>(
-          icon: const Icon(Icons.more_vert),
-          onSelected: (v) => _handleNodeMenuList(parentList, idx, childPath, v),
-          itemBuilder:
-              (ctx) => const [
-                PopupMenuItem(value: 'open', child: Text('Open')),
-                PopupMenuItem(value: 'duplicate', child: Text('Duplicate')),
-                PopupMenuItem(value: 'moveUp', child: Text('Move Up')),
-                PopupMenuItem(value: 'moveDown', child: Text('Move Down')),
-                PopupMenuItem(
-                  value: 'delete',
-                  child: Text('Delete', style: TextStyle(color: Colors.red)),
-                ),
-              ],
+        trailing: Tooltip(
+          message: 'More actions',
+          child: PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert),
+            onSelected:
+                (v) => _handleNodeMenuList(parentList, idx, childPath, v),
+            itemBuilder:
+                (ctx) => const [
+                  PopupMenuItem(value: 'open', child: Text('Open')),
+                  PopupMenuItem(value: 'duplicate', child: Text('Duplicate')),
+                  PopupMenuItem(value: 'moveUp', child: Text('Move Up')),
+                  PopupMenuItem(value: 'moveDown', child: Text('Move Down')),
+                  PopupMenuItem(
+                    value: 'delete',
+                    child: Text('Delete', style: TextStyle(color: Colors.red)),
+                  ),
+                ],
+          ),
         ),
       ),
     );
@@ -1013,6 +1093,13 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         if (_editorPath != null) {
           final nav = JsonNavigator(_root);
           final current = nav.getNode(_editorPath!);
+          if (!_rawEditorDirty) {
+            final txt = const JsonEncoder.withIndent('  ').convert(current);
+            _setRawEditorTextProgrammatic(txt);
+            _jsonEditHistory.clear();
+            _jsonEditHistory.add(txt);
+            _jsonEditIndex = 0;
+          }
           _rawEditorController.text = const JsonEncoder.withIndent(
             '  ',
           ).convert(current);
@@ -1026,12 +1113,15 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
 
   Widget _buildEditorForPrimitive(String path, dynamic value) {
     if (value is bool)
-      return Switch(
-        value: value,
-        onChanged: (v) {
-          _pushHistory();
-          _updatePrimitive(path, v);
-        },
+      return Tooltip(
+        message: 'Toggle boolean',
+        child: Switch(
+          value: value,
+          onChanged: (v) {
+            _pushHistory();
+            _updatePrimitive(path, v);
+          },
+        ),
       );
 
     if (value is int) {
@@ -1045,12 +1135,15 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       );
       return Row(
         children: [
-          IconButton(
-            onPressed: () {
-              _pushHistory();
-              _updatePrimitive(path, value - 1);
-            },
-            icon: const Icon(Icons.remove),
+          Tooltip(
+            message: 'Decrease',
+            child: IconButton(
+              onPressed: () {
+                _pushHistory();
+                _updatePrimitive(path, value - 1);
+              },
+              icon: const Icon(Icons.remove),
+            ),
           ),
           SizedBox(
             width: 120,
@@ -1059,12 +1152,15 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               keyboardType: TextInputType.number,
             ),
           ),
-          IconButton(
-            onPressed: () {
-              _pushHistory();
-              _updatePrimitive(path, value + 1);
-            },
-            icon: const Icon(Icons.add),
+          Tooltip(
+            message: 'Increase',
+            child: IconButton(
+              onPressed: () {
+                _pushHistory();
+                _updatePrimitive(path, value + 1);
+              },
+              icon: const Icon(Icons.add),
+            ),
           ),
         ],
       );
@@ -1081,12 +1177,15 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       );
       return Row(
         children: [
-          IconButton(
-            onPressed: () {
-              _pushHistory();
-              _updatePrimitive(path, (value - 0.1));
-            },
-            icon: const Icon(Icons.remove),
+          Tooltip(
+            message: 'Decrease',
+            child: IconButton(
+              onPressed: () {
+                _pushHistory();
+                _updatePrimitive(path, (value - 0.1));
+              },
+              icon: const Icon(Icons.remove),
+            ),
           ),
           SizedBox(
             width: 140,
@@ -1097,12 +1196,15 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               ),
             ),
           ),
-          IconButton(
-            onPressed: () {
-              _pushHistory();
-              _updatePrimitive(path, (value + 0.1));
-            },
-            icon: const Icon(Icons.add),
+          Tooltip(
+            message: 'Increase',
+            child: IconButton(
+              onPressed: () {
+                _pushHistory();
+                _updatePrimitive(path, (value + 0.1));
+              },
+              icon: const Icon(Icons.add),
+            ),
           ),
         ],
       );
@@ -1118,13 +1220,16 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       children: [
         Expanded(child: TextField(controller: ctrl)),
         const SizedBox(width: 8),
-        IconButton(
-          onPressed: () {
-            ctrl.clear();
-            _pushHistory();
-            _updatePrimitive(path, '');
-          },
-          icon: const Icon(Icons.clear),
+        Tooltip(
+          message: 'Clear',
+          child: IconButton(
+            onPressed: () {
+              ctrl.clear();
+              _pushHistory();
+              _updatePrimitive(path, '');
+            },
+            icon: const Icon(Icons.clear),
+          ),
         ),
       ],
     );
@@ -1144,9 +1249,14 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     setState(() {
       if (_editorPath != null) {
         final current = nav.getNode(_editorPath!);
-        _rawEditorController.text = const JsonEncoder.withIndent(
-          '  ',
-        ).convert(current);
+        final txt = const JsonEncoder.withIndent('  ').convert(current);
+        if (!_rawEditorDirty) {
+          _setRawEditorTextProgrammatic(txt);
+          _jsonEditHistory.clear();
+          _jsonEditHistory.add(txt);
+          _jsonEditIndex = 0;
+        }
+        _rawEditorController.text = txt;
         _selectedJsonCache = _rawEditorController.text;
       }
       if (_selectedPath != null) {
@@ -1304,6 +1414,32 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     }
   }
 
+  void _moveListItemUp(String listPath, int idx) {
+    final nav = JsonNavigator(_root);
+    final list = nav.getNode(listPath);
+    if (list is List && idx > 0) {
+      final tmp = list[idx - 1];
+      list[idx - 1] = list[idx];
+      list[idx] = tmp;
+      setState(() {
+        _valueControllers.removeWhere((p, c) => p.startsWith(listPath));
+      });
+    }
+  }
+
+  void _moveListItemDown(String listPath, int idx) {
+    final nav = JsonNavigator(_root);
+    final list = nav.getNode(listPath);
+    if (list is List && idx < list.length - 1) {
+      final tmp = list[idx + 1];
+      list[idx + 1] = list[idx];
+      list[idx] = tmp;
+      setState(() {
+        _valueControllers.removeWhere((p, c) => p.startsWith(listPath));
+      });
+    }
+  }
+
   void _deleteNodeConfirm(String path) async {
     final ok = await showDialog<bool?>(
       context: context,
@@ -1333,10 +1469,17 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       _selectedPath = p.isEmpty ? null : p;
       _selectedValue = p.isEmpty ? null : nav.getNode(p);
       _editorPath = _selectedPath;
-      _rawEditorController.text =
+      final txt =
           _selectedValue == null
               ? ''
               : const JsonEncoder.withIndent('  ').convert(_selectedValue);
+      if (!_rawEditorDirty) {
+        _setRawEditorTextProgrammatic(txt);
+        _jsonEditHistory.clear();
+        _jsonEditHistory.add(txt);
+        _jsonEditIndex = 0;
+      }
+      _rawEditorController.text = txt;
       _selectedJsonCache = _rawEditorController.text;
       _valueControllers.removeWhere(
         (k, v) => k.startsWith(path) || k.startsWith(p),
@@ -1385,37 +1528,48 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     return path.substring(0, idx);
   }
 
-  void _applyRawEditor() {
+  // ---------- raw editor save/apply ----------
+  Future<void> _saveRawEditorIfDirty() async {
+    if (!_rawEditorDirty) return;
     if (_editorPath == null) return;
+    final text = _rawEditorController.text;
     try {
-      final parsed = jsonDecode(_rawEditorController.text);
+      final parsed = jsonDecode(text);
       final nav = JsonNavigator(_root);
+      _pushHistory();
       final ok = nav.setNode(_editorPath!, parsed);
       if (!ok) throw Exception('Apply failed');
-      _pushHistory();
       setState(() {
         if (_editorPath != null) {
           final current = nav.getNode(_editorPath!);
-          _rawEditorController.text = const JsonEncoder.withIndent(
-            '  ',
-          ).convert(current);
-          _selectedJsonCache = _rawEditorController.text;
+          final newText = const JsonEncoder.withIndent('  ').convert(current);
+          _setRawEditorTextProgrammatic(newText);
+          _jsonEditHistory.clear();
+          _jsonEditHistory.add(newText);
+          _jsonEditIndex = 0;
+          _selectedJsonCache = newText;
         }
         if (_selectedPath != null) _selectedValue = nav.getNode(_selectedPath!);
+        _rawEditorDirty = false;
       });
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(const SnackBar(content: Text('Applied raw JSON')));
+      ).showSnackBar(const SnackBar(content: Text('Saved JSON to model')));
     } catch (e) {
       _showError('Invalid JSON: $e');
     }
+  }
+
+  void _applyRawEditor() {
+    // kept for compatibility: apply current raw editor immediately
+    _saveRawEditorIfDirty();
   }
 
   // ---------- simple syntax highlighter ----------
   TextSpan _highlightJson(String src) {
     final children = <TextSpan>[];
     final reg = RegExp(
-      r'("(\\.|[^\\"])*")|\b(-?\d+\.?\d*(?:[eE][+-]?\d+)?)\b|\b(true|false|null)\b|[{}\[\],:]',
+      r'(\"(\\\\.|[^\\\\\"])*\")|\\b(-?\\d+\\.?\\d*(?:[eE][+-]?\\d+)?)\\b|\\b(true|false|null)\\b|[{}\\[\\],:]',
       multiLine: true,
     );
     int last = 0;
@@ -1428,7 +1582,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           ),
         );
       final tok = m.group(0)!;
-      if (tok.startsWith('"')) {
+      if (tok.startsWith('\"')) {
         children.add(
           TextSpan(text: tok, style: const TextStyle(color: Color(0xFF6A8759))),
         );
@@ -1436,7 +1590,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         children.add(
           TextSpan(text: tok, style: const TextStyle(color: Color(0xFF9876AA))),
         );
-      } else if (RegExp(r'^-?\d').hasMatch(tok)) {
+      } else if (RegExp(r'^-?\\d').hasMatch(tok)) {
         children.add(
           TextSpan(text: tok, style: const TextStyle(color: Color(0xFF6897BB))),
         );
@@ -1484,25 +1638,43 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                 ),
                 Row(
                   children: [
-                    IconButton(onPressed: _undo, icon: const Icon(Icons.undo)),
-                    IconButton(onPressed: _redo, icon: const Icon(Icons.redo)),
-                    TextButton(
-                      onPressed: () {
-                        setState(() {
-                          _root = {};
-                          _selectedPath = null;
-                          _selectedValue = null;
-                          _editorPath = null;
-                          _rawEditorController.clear();
-                          _valueControllers.clear();
-                          _tileKeys.clear();
-                          _titleKeys.clear();
-                          _selectedJsonCache = '';
-                          _undoStack.clear();
-                          _redoStack.clear();
-                        });
-                      },
-                      child: const Text('Clear'),
+                    Tooltip(
+                      message: 'Undo last document change',
+                      child: IconButton(
+                        onPressed: _undo,
+                        icon: const Icon(Icons.undo),
+                      ),
+                    ),
+                    Tooltip(
+                      message: 'Redo last undone document change',
+                      child: IconButton(
+                        onPressed: _redo,
+                        icon: const Icon(Icons.redo),
+                      ),
+                    ),
+                    Tooltip(
+                      message: 'Clear document',
+                      child: TextButton(
+                        onPressed: () {
+                          setState(() {
+                            _root = {};
+                            _selectedPath = null;
+                            _selectedValue = null;
+                            _editorPath = null;
+                            _rawEditorController.clear();
+                            _valueControllers.clear();
+                            _tileKeys.clear();
+                            _titleKeys.clear();
+                            _selectedJsonCache = '';
+                            _undoStack.clear();
+                            _redoStack.clear();
+                            _jsonEditHistory.clear();
+                            _jsonEditIndex = -1;
+                            _rawEditorDirty = false;
+                          });
+                        },
+                        child: const Text('Clear'),
+                      ),
                     ),
                   ],
                 ),
@@ -1547,9 +1719,12 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                     child: Text('Selected: ${_selectedPath ?? "<none>"}'),
                   ),
                 ),
-                TextButton(
-                  onPressed: () => setState(() {}),
-                  child: const Text('Validate'),
+                Tooltip(
+                  message: 'Validate document',
+                  child: TextButton(
+                    onPressed: () => setState(() {}),
+                    child: const Text('Validate'),
+                  ),
                 ),
               ],
             ),
@@ -1566,26 +1741,37 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                           const SizedBox(height: 8),
                           Row(
                             children: [
-                              ElevatedButton(
-                                onPressed: _applyRawEditor,
-                                child: const Text('Apply'),
+                              Tooltip(
+                                message: 'Apply JSON from editor',
+                                child: ElevatedButton(
+                                  onPressed: _applyRawEditor,
+                                  child: const Text('Apply'),
+                                ),
                               ),
                               const SizedBox(width: 8),
-                              ElevatedButton(
-                                onPressed: () {
-                                  final nav = JsonNavigator(_root);
-                                  final val =
-                                      _editorPath == null
-                                          ? null
-                                          : nav.getNode(_editorPath!);
-                                  _rawEditorController.text =
-                                      val == null
-                                          ? ''
-                                          : const JsonEncoder.withIndent(
-                                            '  ',
-                                          ).convert(val);
-                                },
-                                child: const Text('Reset'),
+                              Tooltip(
+                                message: 'Reset JSON editor to model',
+                                child: ElevatedButton(
+                                  onPressed: () {
+                                    final nav = JsonNavigator(_root);
+                                    final val =
+                                        _editorPath == null
+                                            ? null
+                                            : nav.getNode(_editorPath!);
+                                    final txt =
+                                        val == null
+                                            ? ''
+                                            : const JsonEncoder.withIndent(
+                                              '  ',
+                                            ).convert(val);
+                                    _setRawEditorTextProgrammatic(txt);
+                                    _jsonEditHistory.clear();
+                                    _jsonEditHistory.add(txt);
+                                    _jsonEditIndex = 0;
+                                    _rawEditorDirty = false;
+                                  },
+                                  child: const Text('Reset'),
+                                ),
                               ),
                             ],
                           ),
@@ -1597,167 +1783,236 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       ),
     );
   }
+void _syncInspectorEditors() {
+  final nav = JsonNavigator(_root);
+  final node = nav.getNode(_editorPath);
+  final jsonText =
+      node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
+  _setRawEditorTextProgrammatic(jsonText);
+}
 
-  Widget _buildInspector() {
+/*void _setRawEditorTextProgrammatic(String text) {
+  _rawEditorController.text = text;
+  _rawEditorDirty = false;
+}*/
+
+/*void _saveRawEditorIfDirty() {
+  if (!_rawEditorDirty) return;
+  try {
+    final parsed = jsonDecode(_rawEditorController.text);
     final nav = JsonNavigator(_root);
-    final node = nav.getNode(_editorPath);
-    final display =
-        node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
+    _pushHistory();
+    if (_editorPath == null) {
+      _root = parsed;
+    } else {
+      nav.setNode(_editorPath!, parsed);
+    }
+    setState(() {
+      _rawEditorDirty = false;
+      _syncInspectorEditors();
+    });
+  } catch (e) {
+    _showError('Invalid JSON: $e');
+  }
+}*/
 
-    return Container(
-      color: Colors.grey.shade50,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Padding(
-            padding: EdgeInsets.all(12.0),
-            child: Text(
-              'Inspector',
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
+Widget _buildInspector() {
+  final nav = JsonNavigator(_root);
+  final node = nav.getNode(_editorPath);
+  final display =
+      node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
+
+  // Synchronize JSON editor when switching tabs
+  _inspectorTabController.addListener(() {
+    if (_inspectorTabController.index == 1) {
+      _syncInspectorEditors();
+    }
+  });
+
+  return Container(
+    color: Colors.grey.shade50,
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.all(12.0),
+          child: Text(
+            'Inspector',
+            style: TextStyle(fontWeight: FontWeight.bold),
           ),
-          const Divider(height: 1),
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.all(12.0),
-              child: Column(
-                children: [
-                  // Tabs: View and JSON
-                  TabBar(
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(12.0),
+            child: Column(
+              children: [
+                TabBar(
+                  controller: _inspectorTabController,
+                  tabs: const [Tab(text: 'View'), Tab(text: 'JSON')],
+                  labelColor: Colors.black,
+                ),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: TabBarView(
                     controller: _inspectorTabController,
-                    tabs: const [Tab(text: 'View'), Tab(text: 'JSON')],
-                    labelColor: Colors.black,
-                  ),
-                  const SizedBox(height: 8),
-                  Expanded(
-                    child: TabBarView(
-                      controller: _inspectorTabController,
-                      children: [
-                        // === View: both vertical and horizontal scrolling ===
-                        Scrollbar(
+                    children: [
+                      // ---- Inspector View ----
+                      Scrollbar(
+                        controller: _inspectorVController,
+                        thumbVisibility: true,
+                        child: SingleChildScrollView(
                           controller: _inspectorVController,
-                          thumbVisibility: true,
-                          child: SingleChildScrollView(
-                            controller: _inspectorVController,
-                            child: Scrollbar(
+                          child: Scrollbar(
+                            controller: _inspectorHController,
+                            thumbVisibility: true,
+                            child: SingleChildScrollView(
                               controller: _inspectorHController,
-                              thumbVisibility: true,
-                              child: SingleChildScrollView(
-                                controller: _inspectorHController,
-                                scrollDirection: Axis.horizontal,
-                                child: SelectableText.rich(
-                                  _highlightJson(display),
-                                ),
+                              scrollDirection: Axis.horizontal,
+                              child: SelectableText.rich(
+                                _highlightJson(display),
                               ),
                             ),
                           ),
                         ),
+                      ),
 
-                        // === JSON Editor ===
-                        Column(
-                          children: [
-                            Expanded(
-                              child: TextField(
-                                controller: _rawEditorController,
-                                maxLines: null,
-                                decoration: const InputDecoration(
-                                  border: OutlineInputBorder(),
+                      // ---- JSON Editor ----
+                      Column(
+                        children: [
+                          // Header controls
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            children: [
+                              Tooltip(
+                                message: 'Undo last edit',
+                                child: IconButton(
+                                  icon: const Icon(Icons.undo),
+                                  onPressed: _jsonUndo,
                                 ),
-                                style: const TextStyle(fontFamily: 'monospace'),
                               ),
+                              Tooltip(
+                                message: 'Redo last edit',
+                                child: IconButton(
+                                  icon: const Icon(Icons.redo),
+                                  onPressed: _jsonRedo,
+                                ),
+                              ),
+                              Tooltip(
+                                message: 'Save JSON changes',
+                                child: IconButton(
+                                  icon: const Icon(Icons.save),
+                                  onPressed: _saveRawEditorIfDirty,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+
+                          // JSON text editor
+                          Expanded(
+                            child: TextField(
+                              controller: _rawEditorController,
+                              focusNode: _rawEditorFocusNode,
+                              maxLines: null,
+                              decoration: const InputDecoration(
+                                border: OutlineInputBorder(),
+                              ),
+                              style: const TextStyle(fontFamily: 'monospace'),
                             ),
-                            const SizedBox(height: 8),
-                            Row(
-                              children: [
-                                ElevatedButton(
-                                  onPressed: () {
-                                    try {
-                                      final parsed = jsonDecode(
-                                        _rawEditorController.text,
-                                      );
-                                      final nav = JsonNavigator(_root);
-                                      if (_editorPath == null) {
-                                        if (parsed is Map<String, dynamic>) {
-                                          _pushHistory();
-                                          setState(() {
-                                            _root = parsed;
-                                          });
-                                        } else {
-                                          _showError('Root must be object');
-                                        }
-                                      } else {
-                                        _pushHistory();
-                                        final ok = nav.setNode(
-                                          _editorPath!,
-                                          parsed,
-                                        );
-                                        if (!ok) _showError('Apply failed');
-                                      }
-                                      setState(() {
-                                        _selectedJsonCache =
-                                            _rawEditorController.text;
-                                      });
-                                    } catch (e) {
-                                      _showError('Invalid JSON: $e');
-                                    }
-                                  },
+                          ),
+                          const SizedBox(height: 8),
+
+                          // Action row
+                          Row(
+                            children: [
+                              Tooltip(
+                                message: 'Apply raw JSON to model',
+                                child: ElevatedButton(
+                                  onPressed: _saveRawEditorIfDirty,
                                   child: const Text('Apply JSON'),
                                 ),
-                                const SizedBox(width: 8),
-                                ElevatedButton(
+                              ),
+                              const SizedBox(width: 8),
+                              Tooltip(
+                                message: 'Reset JSON editor to model',
+                                child: ElevatedButton(
                                   onPressed: () {
                                     final nav = JsonNavigator(_root);
-                                    final val =
-                                        _editorPath == null
-                                            ? null
-                                            : nav.getNode(_editorPath!);
-                                    _rawEditorController.text =
-                                        val == null
-                                            ? ''
-                                            : const JsonEncoder.withIndent(
-                                              '  ',
-                                            ).convert(val);
+                                    final val = _editorPath == null
+                                        ? null
+                                        : nav.getNode(_editorPath!);
+                                    final txt = val == null
+                                        ? ''
+                                        : const JsonEncoder.withIndent('  ')
+                                            .convert(val);
+                                    _setRawEditorTextProgrammatic(txt);
+                                    _jsonEditHistory.clear();
+                                    _jsonEditHistory.add(txt);
+                                    _jsonEditIndex = 0;
+                                    _rawEditorDirty = false;
                                   },
                                   child: const Text('Reset'),
                                 ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
-        ],
-      ),
-    );
-  }
+        ),
+      ],
+    ),
+  );
+}
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('BDUI Builder - Stage2.4 Final'),
+        title: const Text('BDUI Builder - Stage2.5 Final'),
         actions: [
+          Tooltip(message: 'Paste BDUI JSON'),
           IconButton(
             onPressed: _pasteAndLoadJson,
             icon: const Icon(Icons.paste),
+            tooltip: 'Paste JSON',
           ),
+          Tooltip(message: 'Load sample config'),
           IconButton(
             onPressed: _loadSample,
             icon: const Icon(Icons.playlist_add_check),
+            tooltip: 'Load sample',
           ),
-          IconButton(onPressed: _copyToClipboard, icon: const Icon(Icons.copy)),
-          IconButton(onPressed: _undo, icon: const Icon(Icons.undo)),
-          IconButton(onPressed: _redo, icon: const Icon(Icons.redo)),
-          if (kIsWeb)
-            IconButton(
-              onPressed: _downloadJsonWeb,
-              icon: const Icon(Icons.download),
-            ),
+          Tooltip(message: 'Copy config to clipboard'),
+          IconButton(
+            onPressed: _copyToClipboard,
+            icon: const Icon(Icons.copy),
+            tooltip: 'Copy',
+          ),
+          Tooltip(message: 'Global Undo'),
+          IconButton(
+            onPressed: _undo,
+            icon: const Icon(Icons.undo),
+            tooltip: 'Undo',
+          ),
+          Tooltip(message: 'Global Redo'),
+          IconButton(
+            onPressed: _redo,
+            icon: const Icon(Icons.redo),
+            tooltip: 'Redo',
+          ),
+          if (kIsWeb) Tooltip(message: 'Download JSON'),
+          IconButton(
+            onPressed: _downloadJsonWeb,
+            icon: const Icon(Icons.download),
+            tooltip: 'Download',
+          ),
         ],
       ),
       body: LayoutBuilder(
