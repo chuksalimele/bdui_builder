@@ -1,15 +1,16 @@
-// BDUI Builder - Stage 1 (final fixes)
-// - Fixed: Inspector horizontal scrollbar interactive (desktop drag/click)
-// - Fixed: auto-center when node is expanded (uses title GlobalKey + onExpansionChanged)
-// - Preserves all prior functionality
+// BDUI Builder - Stage 2.3 (live sync, add/delete fields)
+// Implemented:
+// - Live two-way sync between visual editors and JSON via controller listeners
+// - Inspector always reflects _editorPath (current visual editor context)
+// - Add/Delete fields for Map and List directly in visual editor
+// - Controllers are created once and reused; listeners update nodes on change
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-
-// Web-only import for download. Ignore lint for non-web builds.
 // ignore: avoid_web_libraries_in_flutter
 import 'dart:html' as html;
 
@@ -19,13 +20,12 @@ void main() {
 
 class BDUIApp extends StatelessWidget {
   const BDUIApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'BDUI Builder - Stage1 Fixed',
+      title: 'BDUI Builder - Stage2.3',
       theme: ThemeData(useMaterial3: true),
-      home: const BDUIStage1Page(),
+      home: const BDUIStage2Page(),
       debugShowCheckedModeBanner: false,
     );
   }
@@ -35,22 +35,21 @@ class JsonNavigator {
   final Map<String, dynamic> root;
   JsonNavigator(this.root);
 
-  dynamic getNode(String path) {
-    if (path.isEmpty) return root;
+  dynamic getNode(String? path) {
+    if (path == null || path.isEmpty) return root;
     final parts = path.split('/');
     dynamic cursor = root;
     for (final p in parts) {
       if (cursor == null) return null;
-      if (cursor is Map<String, dynamic>) {
+      if (cursor is Map<String, dynamic>)
         cursor = cursor[p];
-      } else if (cursor is List) {
+      else if (cursor is List) {
         final idx = int.tryParse(p);
         if (idx == null) return null;
         if (idx < 0 || idx >= cursor.length) return null;
         cursor = cursor[idx];
-      } else {
+      } else
         return null;
-      }
     }
     return cursor;
   }
@@ -61,15 +60,12 @@ class JsonNavigator {
     dynamic cursor = root;
     for (int i = 0; i < parts.length - 1; i++) {
       final p = parts[i];
-      if (cursor is Map<String, dynamic>) {
+      if (cursor is Map<String, dynamic>)
         cursor = cursor[p];
-      } else if (cursor is List) {
-        final idx = int.tryParse(p);
-        if (idx == null) return false;
-        cursor = cursor[idx];
-      } else {
+      else if (cursor is List)
+        cursor = cursor[int.parse(p)];
+      else
         return false;
-      }
     }
     final last = parts.last;
     if (cursor is Map<String, dynamic>) {
@@ -84,32 +80,96 @@ class JsonNavigator {
     }
     return false;
   }
+
+  bool insertIntoList(String listPath, dynamic value, [int? atIndex]) {
+    final list = getNode(listPath);
+    if (list is List) {
+      if (atIndex == null)
+        list.add(value);
+      else
+        list.insert(atIndex, value);
+      return true;
+    }
+    return false;
+  }
+
+  bool deleteNode(String path) {
+    if (path.isEmpty) return false;
+    final parts = path.split('/');
+    dynamic cursor = root;
+    for (int i = 0; i < parts.length - 1; i++) {
+      final p = parts[i];
+      if (cursor is Map<String, dynamic>)
+        cursor = cursor[p];
+      else if (cursor is List)
+        cursor = cursor[int.parse(p)];
+      else
+        return false;
+    }
+    final last = parts.last;
+    if (cursor is Map<String, dynamic>) {
+      cursor.remove(last);
+      return true;
+    } else if (cursor is List) {
+      final idx = int.tryParse(last);
+      if (idx == null) return false;
+      if (idx < 0 || idx >= cursor.length) return false;
+      cursor.removeAt(idx);
+      return true;
+    }
+    return false;
+  }
 }
 
-class BDUIStage1Page extends StatefulWidget {
-  const BDUIStage1Page({super.key});
-
+class BDUIStage2Page extends StatefulWidget {
+  const BDUIStage2Page({super.key});
   @override
-  State<BDUIStage1Page> createState() => _BDUIStage1PageState();
+  State<BDUIStage2Page> createState() => _BDUIStage2PageState();
 }
 
-class _BDUIStage1PageState extends State<BDUIStage1Page> {
+class _BDUIStage2PageState extends State<BDUIStage2Page>
+    with TickerProviderStateMixin {
   Map<String, dynamic> _root = {};
   String? _selectedPath;
   dynamic _selectedValue;
-  final TextEditingController _editorController = TextEditingController();
+  String? _editorPath; // node currently shown in visual editor
 
-  // keys and controllers for sidebar scrolling and ensureVisible
+  final TextEditingController _rawEditorController = TextEditingController();
+  final Map<String, TextEditingController> _valueControllers = {};
+  final Map<String, Timer?> _debounceTimers = {};
+  String _selectedJsonCache = '';
+
   final Map<String, GlobalKey> _tileKeys = {};
   final Map<String, GlobalKey> _titleKeys = {};
   final ScrollController _sidebarScroll = ScrollController();
   final GlobalKey _sidebarRootKey = GlobalKey();
 
-  // Inspector scroll controllers (horizontal + vertical)
   final ScrollController _inspectorHController = ScrollController();
   final ScrollController _inspectorVController = ScrollController();
 
-  // ---------------------- JSON load / apply / export ----------------------
+  late TabController _inspectorTabController;
+
+  @override
+  void initState() {
+    super.initState();
+    _inspectorTabController = TabController(length: 2, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    _inspectorTabController.dispose();
+    for (final c in _valueControllers.values) c.dispose();
+    for (final t in _debounceTimers.values) t?.cancel();
+    _valueControllers.clear();
+    _debounceTimers.clear();
+    _rawEditorController.dispose();
+    _inspectorHController.dispose();
+    _inspectorVController.dispose();
+    _sidebarScroll.dispose();
+    super.dispose();
+  }
+
+  // ---------- IO ----------
   void _loadJsonString(String txt) {
     try {
       final dynamic parsed = jsonDecode(txt);
@@ -118,9 +178,12 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
           _root = parsed;
           _selectedPath = null;
           _selectedValue = null;
-          _editorController.clear();
+          _editorPath = null;
+          _rawEditorController.clear();
+          _valueControllers.clear();
           _tileKeys.clear();
           _titleKeys.clear();
+          _selectedJsonCache = '';
         });
         ScaffoldMessenger.of(
           context,
@@ -130,14 +193,10 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
           const SnackBar(content: Text('Root JSON must be an object')),
         );
       }
-    } on FormatException catch (fe) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('JSON parse error: ${fe.message}')),
-      );
     } catch (e) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Failed to parse JSON: $e')));
+      ).showSnackBar(SnackBar(content: Text('JSON parse error: $e')));
     }
   }
 
@@ -177,65 +236,9 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
   }
 
   void _loadSample() {
-    const sample = '''
-{
-  "globalVariable": {
-    "selectedCategoryOnCategoryPage": {
-      "type": "String",
-      "defaultValue": ""
-    }
-  },
-  "widgetRegister": {
-    "wrDefaultGrid": {
-      "type": "defaultGrid",
-      "options": {
-        "limit": 12
-      }
-    }
-  },
-  "pages": [
-    {
-      "pageName": "home",
-      "sections": [
-        {
-          "widgetRegister": "wrDeals"
-        },
-        {
-          "widgetRegister": "wrFeatured"
-        }
-      ]
-    },
-    {
-      "pageName": "category"
-    }
-  ]
-}
-''';
+    const sample =
+        '{"globalVariable":{"foo":{"type":"String","defaultValue":""}},"pages":[{"pageName":"home"}]}';
     _loadJsonString(sample);
-  }
-
-  void _applyEditorChanges() {
-    if (_selectedPath == null) return;
-    try {
-      final parsed = jsonDecode(_editorController.text);
-      final nav = JsonNavigator(_root);
-      final ok = nav.setNode(_selectedPath!, parsed);
-      if (!ok) throw Exception('Failed to set node');
-      setState(() {
-        _selectedValue = parsed;
-      });
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Node updated')));
-    } on FormatException catch (fe) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Invalid JSON: ${fe.message}')));
-    } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Failed to update node: $e')));
-    }
   }
 
   Future<void> _copyToClipboard() async {
@@ -268,19 +271,22 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
     }
   }
 
-  // ---------------------- selection & scrolling ----------------------
+  // ---------- selection & scrolling ----------
   void _selectPath(String path, {bool ensureCenter = true}) {
     final nav = JsonNavigator(_root);
     final val = nav.getNode(path);
     setState(() {
       _selectedPath = path;
       _selectedValue = val;
-      _editorController.text = const JsonEncoder.withIndent('  ').convert(val);
+      _editorPath = path;
+      _rawEditorController.text = const JsonEncoder.withIndent(
+        '  ',
+      ).convert(val);
+      _selectedJsonCache = _rawEditorController.text;
     });
 
     if (!ensureCenter) return;
 
-    // try ensureVisible on title key first
     final titleKey = _titleKeys[path];
     if (titleKey != null && titleKey.currentContext != null) {
       try {
@@ -291,12 +297,8 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
           curve: Curves.easeInOut,
         );
         return;
-      } catch (_) {
-        // fall through to manual scroll
-      }
+      } catch (_) {}
     }
-
-    // fallback manual scroll to center
     WidgetsBinding.instance.addPostFrameCallback(
       (_) => _manualScrollToCenter(path),
     );
@@ -328,7 +330,7 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
     );
   }
 
-  // ---------------------- tree building ----------------------
+  // ---------- tree building ----------
   Widget _buildTreeWidgets(Map<String, dynamic> map, [String parentPath = '']) {
     final List<Widget> children = [];
     map.forEach((k, v) {
@@ -343,7 +345,6 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
     String path,
     dynamic value,
   ) {
-    // ensure unique keys
     final tileKey = _tileKeys.putIfAbsent(path, () => GlobalKey());
     final titleKey = _titleKeys.putIfAbsent(path, () => GlobalKey());
 
@@ -351,12 +352,10 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
       return ExpansionTile(
         key: PageStorageKey(path),
         onExpansionChanged: (expanded) {
-          if (expanded) {
-            // after expansion, center the title in view
+          if (expanded)
             WidgetsBinding.instance.addPostFrameCallback(
               (_) => _selectPath(path, ensureCenter: true),
             );
-          }
         },
         title: GestureDetector(
           key: titleKey,
@@ -371,7 +370,7 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
         ],
       );
     } else if (value is List) {
-      final List<Widget> items = [];
+      final items = <Widget>[];
       for (int i = 0; i < value.length; i++) {
         final childPath = '$path/$i';
         final childDisplay = '$displayKey[$i]';
@@ -462,11 +461,781 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
     );
   }
 
+  // ---------- visual inspector (drill-down) ----------
+  Widget _buildVisualInspector() {
+    if (_editorPath == null)
+      return const Center(child: Text('No node selected'));
+    final nav = JsonNavigator(_root);
+    final node = nav.getNode(_editorPath!);
+    final crumbs =
+        (_editorPath == null || _editorPath!.isEmpty)
+            ? <String>[]
+            : _editorPath!.split('/');
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          children: [
+            TextButton(
+              onPressed: () => setState(() => _editorPath = _selectedPath),
+              child: const Text('root'),
+            ),
+            for (int i = 0; i < crumbs.length; i++) ...[
+              const Text(' / '),
+              TextButton(
+                onPressed:
+                    () => setState(
+                      () => _editorPath = crumbs.sublist(0, i + 1).join('/'),
+                    ),
+                child: Text(crumbs[i]),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 8),
+        Expanded(child: _buildImmediateChildrenEditor(_editorPath!, node)),
+      ],
+    );
+  }
+
+  Widget _buildImmediateChildrenEditor(String path, dynamic node) {
+    if (node is Map<String, dynamic>) {
+      final entries = node.entries.toList();
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'Map: $path',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              Row(
+                children: [
+                  IconButton(
+                    onPressed: () => _addMapKeyDialog(path),
+                    icon: const Icon(Icons.add),
+                  ),
+                  IconButton(
+                    onPressed: () => _deleteNodeConfirm(path),
+                    icon: const Icon(Icons.delete),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: ListView.builder(
+              itemCount: entries.length,
+              itemBuilder: (ctx, i) {
+                final k = entries[i].key;
+                final v = entries[i].value;
+                final childPath = '$path/$k';
+                return _immediateChildTile(k, childPath, v);
+              },
+            ),
+          ),
+        ],
+      );
+    }
+
+    if (node is List) {
+      final list = node;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'List: $path',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              Row(
+                children: [
+                  IconButton(
+                    onPressed: () => _addListItemDialog(path),
+                    icon: const Icon(Icons.add),
+                  ),
+                  IconButton(
+                    onPressed: () => _deleteNodeConfirm(path),
+                    icon: const Icon(Icons.delete),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: ListView.builder(
+              itemCount: list.length,
+              itemBuilder: (ctx, i) {
+                final v = list[i];
+                final childPath = '$path/$i';
+                return _immediateChildTile('[$i]', childPath, v);
+              },
+            ),
+          ),
+        ],
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.all(8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Value at $path'),
+          const SizedBox(height: 8),
+          _buildEditorForPrimitive(path, node),
+        ],
+      ),
+    );
+  }
+
+  Widget _immediateChildTile(String label, String childPath, dynamic value) {
+    if (value is String ||
+        value is int ||
+        value is double ||
+        value is bool ||
+        value == null) {
+      return Card(
+        margin: const EdgeInsets.symmetric(vertical: 6),
+        child: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Row(
+            children: [
+              Expanded(child: Text(label)),
+              const SizedBox(width: 12),
+              Expanded(child: _buildEditorForPrimitive(childPath, value)),
+              IconButton(
+                onPressed: () => _deleteNodeConfirm(childPath),
+                icon: const Icon(Icons.delete),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final subtitle =
+        value is Map
+            ? 'Map (${(value as Map).length} keys)'
+            : 'List (${(value as List).length} items)';
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      child: ListTile(
+        title: Text(label),
+        subtitle: Text(subtitle),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.open_in_new),
+              onPressed: () => setState(() => _editorPath = childPath),
+            ),
+            IconButton(
+              onPressed: () => _deleteNodeConfirm(childPath),
+              icon: const Icon(Icons.delete),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  TextEditingController _attachController(
+    String path,
+    String initial, {
+    required ValueChanged<String> onChanged,
+  }) {
+    final existing = _valueControllers[path];
+    if (existing != null) {
+      if (existing.text != initial) existing.text = initial;
+      return existing;
+    }
+    final ctrl = TextEditingController(text: initial);
+    _valueControllers[path] = ctrl;
+
+    // debounce changes to avoid heavy setState on every keystroke
+    ctrl.addListener(() {
+      _debounceTimers[path]?.cancel();
+      _debounceTimers[path] = Timer(const Duration(milliseconds: 300), () {
+        onChanged(ctrl.text);
+      });
+    });
+
+    return ctrl;
+  }
+
+  Widget _buildEditorForPrimitive(String path, dynamic value) {
+    if (value is bool)
+      return Switch(value: value, onChanged: (v) => _updatePrimitive(path, v));
+
+    if (value is int) {
+      final ctrl = _attachController(
+        path,
+        value.toString(),
+        onChanged: (s) {
+          final n = int.tryParse(s);
+          if (n != null) _updatePrimitive(path, n);
+        },
+      );
+      return Row(
+        children: [
+          IconButton(
+            onPressed: () => _updatePrimitive(path, value - 1),
+            icon: const Icon(Icons.remove),
+          ),
+          SizedBox(
+            width: 120,
+            child: TextField(
+              controller: ctrl,
+              keyboardType: TextInputType.number,
+            ),
+          ),
+          IconButton(
+            onPressed: () => _updatePrimitive(path, value + 1),
+            icon: const Icon(Icons.add),
+          ),
+        ],
+      );
+    }
+
+    if (value is double) {
+      final ctrl = _attachController(
+        path,
+        value.toString(),
+        onChanged: (s) {
+          final n = double.tryParse(s);
+          if (n != null) _updatePrimitive(path, n);
+        },
+      );
+      return Row(
+        children: [
+          IconButton(
+            onPressed: () => _updatePrimitive(path, (value - 0.1)),
+            icon: const Icon(Icons.remove),
+          ),
+          SizedBox(
+            width: 140,
+            child: TextField(
+              controller: ctrl,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+            ),
+          ),
+          IconButton(
+            onPressed: () => _updatePrimitive(path, (value + 0.1)),
+            icon: const Icon(Icons.add),
+          ),
+        ],
+      );
+    }
+
+    // string or null
+    final ctrl = _attachController(
+      path,
+      value?.toString() ?? '',
+      onChanged: (s) => _updatePrimitive(path, s),
+    );
+    return Row(
+      children: [
+        Expanded(child: TextField(controller: ctrl)),
+        const SizedBox(width: 8),
+        IconButton(
+          onPressed: () {
+            ctrl.clear();
+            _updatePrimitive(path, '');
+          },
+          icon: const Icon(Icons.clear),
+        ),
+      ],
+    );
+  }
+
+  void _showError(String msg) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+
+  void _updatePrimitive(String path, dynamic newValue) {
+    final nav = JsonNavigator(_root);
+    final ok = nav.setNode(path, newValue);
+    if (!ok) {
+      _showError('Failed to update value');
+      return;
+    }
+    // update inspector and selectedValue if relevant
+    setState(() {
+      if (_editorPath != null) {
+        final current = nav.getNode(_editorPath!);
+        _rawEditorController.text = const JsonEncoder.withIndent(
+          '  ',
+        ).convert(current);
+        _selectedJsonCache = _rawEditorController.text;
+      }
+      if (_selectedPath != null) {
+        _selectedValue = nav.getNode(_selectedPath!);
+      }
+    });
+  }
+
+  // ---------- dialogs / add helpers ----------
+  Future<void> _addMapKeyDialog(String mapPath) async {
+    final keyCtrl = TextEditingController();
+    final typeCtrl = TextEditingController(text: 'string');
+    final valueCtrl = TextEditingController();
+    final res = await showDialog<bool?>(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Add key'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: keyCtrl,
+                  decoration: const InputDecoration(labelText: 'Key'),
+                ),
+                DropdownButtonFormField<String>(
+                  value: 'string',
+                  items: const [
+                    DropdownMenuItem(value: 'string', child: Text('String')),
+                    DropdownMenuItem(value: 'int', child: Text('Int')),
+                    DropdownMenuItem(value: 'double', child: Text('Double')),
+                    DropdownMenuItem(value: 'bool', child: Text('Bool')),
+                    DropdownMenuItem(value: 'map', child: Text('Map')),
+                    DropdownMenuItem(value: 'list', child: Text('List')),
+                  ],
+                  onChanged: (v) => typeCtrl.text = v ?? 'string',
+                ),
+                TextField(
+                  controller: valueCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Value (for primitives)',
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Add'),
+              ),
+            ],
+          ),
+    );
+    if (res != true) return;
+    final k = keyCtrl.text.trim();
+    if (k.isEmpty) return _showError('Key required');
+    final t = typeCtrl.text.trim();
+    dynamic val;
+    if (t == 'int')
+      val = int.tryParse(valueCtrl.text) ?? 0;
+    else if (t == 'double')
+      val = double.tryParse(valueCtrl.text) ?? 0.0;
+    else if (t == 'bool')
+      val = (valueCtrl.text.toLowerCase() == 'true');
+    else if (t == 'map')
+      val = <String, dynamic>{};
+    else if (t == 'list')
+      val = <dynamic>[];
+    else
+      val = valueCtrl.text;
+    final nav = JsonNavigator(_root);
+    final map = nav.getNode(mapPath);
+    if (map is Map<String, dynamic>) {
+      if (map.containsKey(k)) return _showError('Key exists');
+      map[k] = val;
+      setState(() {
+        _valueControllers.removeWhere((p, c) => p.startsWith(mapPath));
+      });
+    } else
+      _showError('Target not map');
+  }
+
+  Future<void> _addListItemDialog(String listPath) async {
+    final typeCtrl = TextEditingController(text: 'string');
+    final valueCtrl = TextEditingController();
+    final res = await showDialog<bool?>(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Add list item'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                DropdownButtonFormField<String>(
+                  value: 'string',
+                  items: const [
+                    DropdownMenuItem(value: 'string', child: Text('String')),
+                    DropdownMenuItem(value: 'int', child: Text('Int')),
+                    DropdownMenuItem(value: 'double', child: Text('Double')),
+                    DropdownMenuItem(value: 'bool', child: Text('Bool')),
+                    DropdownMenuItem(value: 'map', child: Text('Map')),
+                    DropdownMenuItem(value: 'list', child: Text('List')),
+                  ],
+                  onChanged: (v) => typeCtrl.text = v ?? 'string',
+                ),
+                TextField(
+                  controller: valueCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Value (for primitives)',
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Add'),
+              ),
+            ],
+          ),
+    );
+    if (res != true) return;
+    final t = typeCtrl.text.trim();
+    dynamic val;
+    if (t == 'int')
+      val = int.tryParse(valueCtrl.text) ?? 0;
+    else if (t == 'double')
+      val = double.tryParse(valueCtrl.text) ?? 0.0;
+    else if (t == 'bool')
+      val = (valueCtrl.text.toLowerCase() == 'true');
+    else if (t == 'map')
+      val = <String, dynamic>{};
+    else if (t == 'list')
+      val = <dynamic>[];
+    else
+      val = valueCtrl.text;
+    final nav = JsonNavigator(_root);
+    final ok = nav.insertIntoList(listPath, val);
+    if (!ok)
+      _showError('Target is not a list');
+    else
+      setState(() {
+        _valueControllers.removeWhere((p, c) => p.startsWith(listPath));
+      });
+  }
+
+  void _moveListItemUp(String listPath, int idx) {
+    final nav = JsonNavigator(_root);
+    final list = nav.getNode(listPath);
+    if (list is List && idx > 0) {
+      final tmp = list[idx - 1];
+      list[idx - 1] = list[idx];
+      list[idx] = tmp;
+      setState(() {
+        _valueControllers.removeWhere((p, c) => p.startsWith(listPath));
+      });
+    }
+  }
+
+  void _moveListItemDown(String listPath, int idx) {
+    final nav = JsonNavigator(_root);
+    final list = nav.getNode(listPath);
+    if (list is List && idx < list.length - 1) {
+      final tmp = list[idx + 1];
+      list[idx + 1] = list[idx];
+      list[idx] = tmp;
+      setState(() {
+        _valueControllers.removeWhere((p, c) => p.startsWith(listPath));
+      });
+    }
+  }
+
+  void _deleteNodeConfirm(String path) async {
+    final ok = await showDialog<bool?>(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Delete node'),
+            content: Text('Delete $path?'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
+    );
+    if (ok != true) return;
+    final nav = JsonNavigator(_root);
+    final success = nav.deleteNode(path);
+    if (!success) return _showError('Delete failed');
+    final p = _parentPath(path) ?? '';
+    setState(() {
+      _selectedPath = p.isEmpty ? null : p;
+      _selectedValue = p.isEmpty ? null : nav.getNode(p);
+      _editorPath = _selectedPath;
+      _rawEditorController.text =
+          _selectedValue == null
+              ? ''
+              : const JsonEncoder.withIndent('  ').convert(_selectedValue);
+      _selectedJsonCache = _rawEditorController.text;
+      _valueControllers.removeWhere(
+        (k, v) => k.startsWith(path) || k.startsWith(p),
+      );
+    });
+  }
+
+  Future<void> _renameMapKeyDialog(String mapPath, String key) async {
+    final ctrl = TextEditingController(text: key);
+    final ok = await showDialog<bool?>(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Rename key'),
+            content: TextField(controller: ctrl),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Rename'),
+              ),
+            ],
+          ),
+    );
+    if (ok != true) return;
+    final newKey = ctrl.text.trim();
+    if (newKey.isEmpty) return _showError('Key required');
+    final nav = JsonNavigator(_root);
+    final map = nav.getNode(mapPath);
+    if (map is Map<String, dynamic>) {
+      final val = map.remove(key);
+      map[newKey] = val;
+      setState(() {
+        _valueControllers.removeWhere((p, c) => p.startsWith(mapPath));
+      });
+    }
+  }
+
+  String? _parentPath(String path) {
+    if (!path.contains('/')) return '';
+    final idx = path.lastIndexOf('/');
+    return path.substring(0, idx);
+  }
+
+  void _applyRawEditor() {
+    if (_editorPath == null) return;
+    try {
+      final parsed = jsonDecode(_rawEditorController.text);
+      final nav = JsonNavigator(_root);
+      final ok = nav.setNode(_editorPath!, parsed);
+      if (!ok) throw Exception('Apply failed');
+      setState(() {
+        if (_editorPath != null) {
+          final current = nav.getNode(_editorPath!);
+          _rawEditorController.text = const JsonEncoder.withIndent(
+            '  ',
+          ).convert(current);
+          _selectedJsonCache = _rawEditorController.text;
+        }
+        if (_selectedPath != null) _selectedValue = nav.getNode(_selectedPath!);
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Applied raw JSON')));
+    } catch (e) {
+      _showError('Invalid JSON: $e');
+    }
+  }
+
+  // ---------- UI build ----------
+  Widget _buildSidebar() {
+    return Container(
+      key: _sidebarRootKey,
+      color: Colors.grey.shade100,
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(12.0),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Document Tree',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                TextButton(
+                  onPressed: () {
+                    setState(() {
+                      _root = {};
+                      _selectedPath = null;
+                      _selectedValue = null;
+                      _editorPath = null;
+                      _rawEditorController.clear();
+                      _valueControllers.clear();
+                      _tileKeys.clear();
+                      _titleKeys.clear();
+                      _selectedJsonCache = '';
+                    });
+                  },
+                  child: const Text('Clear'),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child:
+                _root.isEmpty
+                    ? const Center(
+                      child: Text(
+                        'No document loaded. Use Paste or Load Sample',
+                      ),
+                    )
+                    : SingleChildScrollView(
+                      controller: _sidebarScroll,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8.0),
+                        child: _buildTreeWidgets(_root),
+                      ),
+                    ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCenterEditor() {
+    return Container(
+      color: Colors.white,
+      child: Column(
+        children: [
+          Container(
+            height: 52,
+            color: Colors.grey.shade50,
+            child: Row(
+              children: [
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: Text('Selected: ${_selectedPath ?? "<none>"}'),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => setState(() {}),
+                  child: const Text('Validate'),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child:
+                _editorPath == null
+                    ? const Center(child: Text('Select a node to edit'))
+                    : Padding(
+                      padding: const EdgeInsets.all(8),
+                      child: Column(
+                        children: [
+                          Expanded(child: _buildVisualInspector()),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              ElevatedButton(
+                                onPressed: _applyRawEditor,
+                                child: const Text('Apply'),
+                              ),
+                              const SizedBox(width: 8),
+                              ElevatedButton(
+                                onPressed: () {
+                                  final nav = JsonNavigator(_root);
+                                  final val =
+                                      _editorPath == null
+                                          ? null
+                                          : nav.getNode(_editorPath!);
+                                  _rawEditorController.text =
+                                      val == null
+                                          ? ''
+                                          : const JsonEncoder.withIndent(
+                                            '  ',
+                                          ).convert(val);
+                                },
+                                child: const Text('Reset'),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInspector() {
+    final nav = JsonNavigator(_root);
+    final node = nav.getNode(_editorPath);
+    final display =
+        node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
+
+    return Container(
+      color: Colors.grey.shade50,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.all(12.0),
+            child: Text(
+              'Inspector',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(12.0),
+              child: Scrollbar(
+                controller: _inspectorHController,
+                thumbVisibility: true,
+                interactive: true,
+                child: SingleChildScrollView(
+                  controller: _inspectorHController,
+                  scrollDirection: Axis.horizontal,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(minWidth: 600),
+                    child: SingleChildScrollView(
+                      controller: _inspectorVController,
+                      child: SelectableText(
+                        display,
+                        style: const TextStyle(fontFamily: 'monospace'),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('BDUI Builder - Stage1 Fixed'),
+        title: const Text('BDUI Builder - Stage2.3'),
         actions: [
           IconButton(
             onPressed: _pasteAndLoadJson,
@@ -487,205 +1256,18 @@ class _BDUIStage1PageState extends State<BDUIStage1Page> {
       body: LayoutBuilder(
         builder: (context, constraints) {
           final maxWidth = constraints.maxWidth;
-          final leftWidth = (maxWidth * 0.28).clamp(240.0, 520.0);
-          final rightWidth = (maxWidth * 0.32).clamp(260.0, 640.0);
-
+          final leftWidth = (maxWidth * 0.26).clamp(240.0, 520.0);
+          final rightWidth = (maxWidth * 0.32).clamp(280.0, 640.0);
           return Row(
             children: [
-              // Sidebar
               ConstrainedBox(
                 constraints: BoxConstraints.tightFor(width: leftWidth),
-                child: Container(
-                  key: _sidebarRootKey,
-                  color: Colors.grey.shade100,
-                  child: Column(
-                    children: [
-                      Padding(
-                        padding: const EdgeInsets.all(12.0),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            const Text(
-                              'Document Tree',
-                              style: TextStyle(fontWeight: FontWeight.bold),
-                            ),
-                            TextButton(
-                              onPressed: () {
-                                setState(() {
-                                  _root = {};
-                                  _selectedPath = null;
-                                  _selectedValue = null;
-                                  _editorController.clear();
-                                  _tileKeys.clear();
-                                  _titleKeys.clear();
-                                });
-                              },
-                              child: const Text('Clear'),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const Divider(height: 1),
-                      Expanded(
-                        child:
-                            _root.isEmpty
-                                ? const Center(
-                                  child: Text(
-                                    'No document loaded. Use Paste or Load Sample',
-                                  ),
-                                )
-                                : SingleChildScrollView(
-                                  controller: _sidebarScroll,
-                                  child: Padding(
-                                    padding: const EdgeInsets.symmetric(
-                                      vertical: 8.0,
-                                    ),
-                                    child: _buildTreeWidgets(_root),
-                                  ),
-                                ),
-                      ),
-                    ],
-                  ),
-                ),
+                child: _buildSidebar(),
               ),
-
-              // Center editor
-              Expanded(
-                child: Container(
-                  color: Colors.white,
-                  child: Column(
-                    children: [
-                      Container(
-                        height: 52,
-                        color: Colors.grey.shade50,
-                        child: Row(
-                          children: [
-                            Expanded(
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                ),
-                                child: Text(
-                                  'Selected: ${_selectedPath ?? "<none>"}',
-                                ),
-                              ),
-                            ),
-                            TextButton(
-                              onPressed: () => setState(() {}),
-                              child: const Text('Validate'),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Expanded(
-                        child:
-                            _selectedPath == null
-                                ? const Center(
-                                  child: Text('Select a node to edit its JSON'),
-                                )
-                                : Padding(
-                                  padding: const EdgeInsets.all(12.0),
-                                  child: Column(
-                                    children: [
-                                      Expanded(
-                                        child: TextField(
-                                          controller: _editorController,
-                                          maxLines: null,
-                                          expands: true,
-                                          decoration: const InputDecoration(
-                                            border: OutlineInputBorder(),
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(height: 8),
-                                      Row(
-                                        children: [
-                                          ElevatedButton(
-                                            onPressed: _applyEditorChanges,
-                                            child: const Text('Apply'),
-                                          ),
-                                          const SizedBox(width: 8),
-                                          ElevatedButton(
-                                            onPressed: () {
-                                              _editorController.text =
-                                                  const JsonEncoder.withIndent(
-                                                    '  ',
-                                                  ).convert(_selectedValue);
-                                            },
-                                            child: const Text('Reset'),
-                                          ),
-                                        ],
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-              // Inspector (right) - horizontal + vertical scroll controllers with interactive scrollbar
+              Expanded(child: _buildCenterEditor()),
               ConstrainedBox(
                 constraints: BoxConstraints.tightFor(width: rightWidth),
-                child: Container(
-                  color: Colors.grey.shade50,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Padding(
-                        padding: const EdgeInsets.all(12.0),
-                        child: const Text(
-                          'Inspector',
-                          style: TextStyle(fontWeight: FontWeight.bold),
-                        ),
-                      ),
-                      const Divider(height: 1),
-                      Expanded(
-                        child: Padding(
-                          padding: const EdgeInsets.all(12.0),
-                          child:
-                              _selectedPath == null
-                                  ? const Text('No node selected')
-                                  : Scrollbar(
-                                    controller: _inspectorHController,
-                                    thumbVisibility: true,
-                                    interactive: true,
-                                    child: SingleChildScrollView(
-                                      controller: _inspectorHController,
-                                      scrollDirection: Axis.horizontal,
-                                      child: ConstrainedBox(
-                                        constraints: const BoxConstraints(
-                                          minWidth: 600,
-                                        ),
-                                        child: Scrollbar(
-                                          controller: _inspectorVController,
-                                          thumbVisibility: true,
-                                          interactive: true,
-                                          notificationPredicate:
-                                              (notif) => notif.depth == 1,
-                                          child: SingleChildScrollView(
-                                            controller: _inspectorVController,
-                                            scrollDirection: Axis.vertical,
-                                            child: SelectableText(
-                                              const JsonEncoder.withIndent(
-                                                '  ',
-                                              ).convert(_selectedValue),
-                                              style: const TextStyle(
-                                                fontFamily: 'monospace',
-                                                fontSize: 13,
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+                child: _buildInspector(),
               ),
             ],
           );
