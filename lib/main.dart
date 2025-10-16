@@ -94,29 +94,84 @@ class JsonNavigator {
   }
 
   bool deleteNode(String path) {
-    if (path.isEmpty) return false;
     final parts = path.split('/');
-    dynamic cursor = root;
+    if (parts.isEmpty) return false;
+
+    dynamic parent = root;
     for (int i = 0; i < parts.length - 1; i++) {
       final p = parts[i];
-      if (cursor is Map<String, dynamic>)
-        cursor = cursor[p];
-      else if (cursor is List)
-        cursor = cursor[int.parse(p)];
-      else
+      if (parent is Map) {
+        parent = parent[p];
+      } else if (parent is List) {
+        final idx = int.tryParse(p);
+        if (idx == null || idx < 0 || idx >= parent.length) return false;
+        parent = parent[idx];
+      } else {
         return false;
+      }
     }
+
     final last = parts.last;
-    if (cursor is Map<String, dynamic>) {
-      cursor.remove(last);
-      return true;
-    } else if (cursor is List) {
+    if (parent is Map) {
+      return parent.remove(last) != null;
+    } else if (parent is List) {
       final idx = int.tryParse(last);
-      if (idx == null) return false;
-      if (idx < 0 || idx >= cursor.length) return false;
-      cursor.removeAt(idx);
+      if (idx == null || idx < 0 || idx >= parent.length) return false;
+      parent.removeAt(idx);
       return true;
     }
+    return false;
+  }
+
+  bool renameNode(String path, String newKey) {
+    final parts = path.split('/');
+    if (parts.length < 2) return false;
+
+    final key = parts.last;
+    final parentPath = parts.take(parts.length - 1).join('/');
+    final parent = getNode(parentPath);
+    if (parent is! Map) return false;
+
+    final val = parent.remove(key);
+    if (val == null) return false;
+    parent[newKey] = val;
+    return true;
+  }
+
+  bool duplicateNode(String path) {
+    final node = getNode(path);
+    if (node == null) return false;
+
+    final parts = path.split('/');
+    if (parts.isEmpty) return false;
+
+    dynamic parent = root;
+    for (int i = 0; i < parts.length - 1; i++) {
+      final p = parts[i];
+      if (parent is Map) {
+        parent = parent[p];
+      } else if (parent is List) {
+        final idx = int.tryParse(p);
+        if (idx == null || idx < 0 || idx >= parent.length) return false;
+        parent = parent[idx];
+      } else {
+        return false;
+      }
+    }
+
+    final last = parts.last;
+    if (parent is Map) {
+      final val = jsonDecode(jsonEncode(node)); // deep copy
+      parent['${last}_copy'] = val;
+      return true;
+    } else if (parent is List) {
+      final idx = int.tryParse(last);
+      if (idx == null || idx < 0 || idx >= parent.length) return false;
+      final val = jsonDecode(jsonEncode(node)); // deep copy
+      parent.insert(idx + 1, val);
+      return true;
+    }
+
     return false;
   }
 }
@@ -1783,20 +1838,21 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       ),
     );
   }
-void _syncInspectorEditors() {
-  final nav = JsonNavigator(_root);
-  final node = nav.getNode(_editorPath);
-  final jsonText =
-      node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
-  _setRawEditorTextProgrammatic(jsonText);
-}
 
-/*void _setRawEditorTextProgrammatic(String text) {
+  void _syncInspectorEditors() {
+    final nav = JsonNavigator(_root);
+    final node = nav.getNode(_editorPath);
+    final jsonText =
+        node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
+    _setRawEditorTextProgrammatic(jsonText);
+  }
+
+  /*void _setRawEditorTextProgrammatic(String text) {
   _rawEditorController.text = text;
   _rawEditorDirty = false;
 }*/
 
-/*void _saveRawEditorIfDirty() {
+  /*void _saveRawEditorIfDirty() {
   if (!_rawEditorDirty) return;
   try {
     final parsed = jsonDecode(_rawEditorController.text);
@@ -1816,160 +1872,236 @@ void _syncInspectorEditors() {
   }
 }*/
 
-Widget _buildInspector() {
-  final nav = JsonNavigator(_root);
-  final node = nav.getNode(_editorPath);
-  final display =
-      node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
+  Widget _buildInspector() {
+    final nav = JsonNavigator(_root);
+    final node = nav.getNode(_editorPath);
+    final display =
+        node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
 
-  // Synchronize JSON editor when switching tabs
-  _inspectorTabController.addListener(() {
-    if (_inspectorTabController.index == 1) {
-      _syncInspectorEditors();
-    }
-  });
-
-  return Container(
-    color: Colors.grey.shade50,
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Padding(
-          padding: EdgeInsets.all(12.0),
-          child: Text(
-            'Inspector',
-            style: TextStyle(fontWeight: FontWeight.bold),
+    return Container(
+      color: Colors.grey.shade50,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.all(12.0),
+            child: Text(
+              'Inspector',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
           ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: Padding(
-            padding: const EdgeInsets.all(12.0),
-            child: Column(
-              children: [
-                TabBar(
-                  controller: _inspectorTabController,
-                  tabs: const [Tab(text: 'View'), Tab(text: 'JSON')],
-                  labelColor: Colors.black,
-                ),
-                const SizedBox(height: 8),
-                Expanded(
-                  child: TabBarView(
+          const Divider(height: 1),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(12.0),
+              child: Column(
+                children: [
+                  TabBar(
                     controller: _inspectorTabController,
-                    children: [
-                      // ---- Inspector View ----
-                      Scrollbar(
-                        controller: _inspectorVController,
-                        thumbVisibility: true,
-                        child: SingleChildScrollView(
+                    tabs: const [Tab(text: 'View'), Tab(text: 'JSON')],
+                    labelColor: Colors.black,
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: TabBarView(
+                      controller: _inspectorTabController,
+                      children: [
+                        // --- Inspector View ---
+                        Scrollbar(
                           controller: _inspectorVController,
-                          child: Scrollbar(
-                            controller: _inspectorHController,
-                            thumbVisibility: true,
-                            child: SingleChildScrollView(
+                          thumbVisibility: true,
+                          child: SingleChildScrollView(
+                            controller: _inspectorVController,
+                            child: Scrollbar(
                               controller: _inspectorHController,
-                              scrollDirection: Axis.horizontal,
-                              child: SelectableText.rich(
-                                _highlightJson(display),
+                              thumbVisibility: true,
+                              child: SingleChildScrollView(
+                                controller: _inspectorHController,
+                                scrollDirection: Axis.horizontal,
+                                child: SelectableText.rich(
+                                  _highlightJson(display),
+                                ),
                               ),
                             ),
                           ),
                         ),
-                      ),
 
-                      // ---- JSON Editor ----
-                      Column(
-                        children: [
-                          // Header controls
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.end,
-                            children: [
-                              Tooltip(
-                                message: 'Undo last edit',
-                                child: IconButton(
-                                  icon: const Icon(Icons.undo),
-                                  onPressed: _jsonUndo,
+                        // --- JSON Editor ---
+                        Column(
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.end,
+                              children: [
+                                Tooltip(
+                                  message: 'Undo last edit',
+                                  child: IconButton(
+                                    onPressed: _jsonUndo,
+                                    icon: const Icon(Icons.undo),
+                                  ),
                                 ),
-                              ),
-                              Tooltip(
-                                message: 'Redo last edit',
-                                child: IconButton(
-                                  icon: const Icon(Icons.redo),
-                                  onPressed: _jsonRedo,
+                                Tooltip(
+                                  message: 'Redo last edit',
+                                  child: IconButton(
+                                    onPressed: _jsonRedo,
+                                    icon: const Icon(Icons.redo),
+                                  ),
                                 ),
-                              ),
-                              Tooltip(
-                                message: 'Save JSON changes',
-                                child: IconButton(
-                                  icon: const Icon(Icons.save),
-                                  onPressed: _saveRawEditorIfDirty,
+                                Tooltip(
+                                  message: 'Save JSON changes',
+                                  child: IconButton(
+                                    onPressed: _saveRawEditorIfDirty,
+                                    icon: const Icon(Icons.save),
+                                  ),
                                 ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-
-                          // JSON text editor
-                          Expanded(
-                            child: TextField(
-                              controller: _rawEditorController,
-                              focusNode: _rawEditorFocusNode,
-                              maxLines: null,
-                              decoration: const InputDecoration(
-                                border: OutlineInputBorder(),
-                              ),
-                              style: const TextStyle(fontFamily: 'monospace'),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-
-                          // Action row
-                          Row(
-                            children: [
-                              Tooltip(
-                                message: 'Apply raw JSON to model',
-                                child: ElevatedButton(
-                                  onPressed: _saveRawEditorIfDirty,
-                                  child: const Text('Apply JSON'),
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Tooltip(
-                                message: 'Reset JSON editor to model',
-                                child: ElevatedButton(
-                                  onPressed: () {
-                                    final nav = JsonNavigator(_root);
-                                    final val = _editorPath == null
-                                        ? null
-                                        : nav.getNode(_editorPath!);
-                                    final txt = val == null
-                                        ? ''
-                                        : const JsonEncoder.withIndent('  ')
-                                            .convert(val);
-                                    _setRawEditorTextProgrammatic(txt);
-                                    _jsonEditHistory.clear();
-                                    _jsonEditHistory.add(txt);
-                                    _jsonEditIndex = 0;
-                                    _rawEditorDirty = false;
+                                PopupMenuButton<String>(
+                                  tooltip: 'More actions',
+                                  icon: const Icon(Icons.more_vert),
+                                  onSelected: (v) {
+                                    switch (v) {
+                                      case 'delete':
+                                        _handleDeleteNode();
+                                        break;
+                                      case 'duplicate':
+                                        _handleDuplicateNode();
+                                        break;
+                                      case 'rename':
+                                        _handleRenameNode();
+                                        break;
+                                    }
                                   },
-                                  child: const Text('Reset'),
+                                  itemBuilder:
+                                      (ctx) => const [
+                                        PopupMenuItem(
+                                          value: 'duplicate',
+                                          child: Text('Duplicate'),
+                                        ),
+                                        PopupMenuItem(
+                                          value: 'rename',
+                                          child: Text('Rename'),
+                                        ),
+                                        PopupMenuItem(
+                                          value: 'delete',
+                                          child: Text(
+                                            'Delete',
+                                            style: TextStyle(color: Colors.red),
+                                          ),
+                                        ),
+                                      ],
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Expanded(
+                              child: Focus(
+                                onFocusChange: (hasFocus) {
+                                  if (!hasFocus && _rawEditorDirty)
+                                    _saveRawEditorIfDirty();
+                                },
+                                child: TextField(
+                                  controller: _rawEditorController,
+                                  focusNode: _rawEditorFocusNode,
+                                  maxLines: null,
+                                  decoration: const InputDecoration(
+                                    border: OutlineInputBorder(),
+                                  ),
+                                  style: const TextStyle(
+                                    fontFamily: 'monospace',
+                                  ),
+                                  onChanged: (v) {
+                                    _rawEditorDirty = true;
+                                    _syncJsonWithView();
+                                  },
                                 ),
                               ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ],
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
-        ),
-      ],
-    ),
-  );
-}
+        ],
+      ),
+    );
+  }
+
+  // --- Synchronization logic ---
+  void _syncJsonWithView() {
+    try {
+      final parsed = jsonDecode(_rawEditorController.text);
+      final nav = JsonNavigator(_root);
+      if (_editorPath == null) {
+        if (parsed is Map<String, dynamic>) {
+          setState(() => _root = parsed);
+        }
+      } else {
+        nav.setNode(_editorPath!, parsed);
+        setState(() {});
+      }
+    } catch (_) {
+      // ignore invalid partial edits
+    }
+  }
+
+  void _handleDeleteNode() {
+    if (_editorPath == null) return;
+    final nav = JsonNavigator(_root);
+    nav.deleteNode(_editorPath!);
+    setState(() {});
+  }
+
+  void _promptRenameNode(String path) async {
+    final parts = path.split('/');
+    final oldName = parts.isNotEmpty ? parts.last : '';
+    final controller = TextEditingController(text: oldName);
+
+    final newName = await showDialog<String>(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Rename Node'),
+            content: TextField(
+              controller: controller,
+              decoration: const InputDecoration(labelText: 'New name'),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+                child: const Text('Rename'),
+              ),
+            ],
+          ),
+    );
+
+    if (newName != null && newName.isNotEmpty && newName != oldName) {
+      final nav = JsonNavigator(_root);
+      final ok = nav.renameNode(path, newName);
+      if (!ok) {
+        _showError('Rename failed');
+      } else {
+        setState(() {});
+      }
+    }
+  }
+
+  void _handleDuplicateNode() {
+    if (_editorPath == null) return;
+    final nav = JsonNavigator(_root);
+    nav.duplicateNode(_editorPath!);
+    setState(() {});
+  }
+
+  void _handleRenameNode() {
+    if (_editorPath == null) return;
+    _promptRenameNode(_editorPath!);
+  }
 
   @override
   Widget build(BuildContext context) {
