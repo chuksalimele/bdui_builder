@@ -1,29 +1,23 @@
-// BDUI Builder - Stage 2.5 Final (single-file)
-// Stage 2.5 changes:
-// - JSON editor: Save button in header, Undo/Redo local history (limit 50), apply on focus loss or Save
-// - Inspector View syncs with model; JSON editor reflects model unless user has unsaved edits
-// - Tooltips added to relevant icons
-// - Replaced simulated stubs with real binding logic
+// lib/bdui_stage2_page.dart
+// Full Stage 2.5 restored single-file implementation.
+// No json_editor dependency used. Uses TextField raw editor + inspectors.
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-// ignore: avoid_web_libraries_in_flutter
-import 'dart:html' as html;
+import 'dart:html' as html; // ignore: avoid_web_libraries_in_flutter
+import 'package:flutter_json_viewer/flutter_json_viewer.dart';
 
-void main() {
-  runApp(const BDUIApp());
-}
+void main() => runApp(const BDUIApp());
 
 class BDUIApp extends StatelessWidget {
   const BDUIApp({super.key});
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'BDUI Builder - Stage2.5 Final',
+      title: 'BDUI Builder - Stage2.5 Restored',
       theme: ThemeData(useMaterial3: true),
       home: const BDUIStage2Page(),
       debugShowCheckedModeBanner: false,
@@ -31,51 +25,52 @@ class BDUIApp extends StatelessWidget {
   }
 }
 
+/// Helper navigator that reads/writes JSON nodes by path 'a/b/0/c'
 class JsonNavigator {
-  final Map<String, dynamic> root;
+  Map<String, dynamic> root;
   JsonNavigator(this.root);
 
   dynamic getNode(String? path) {
     if (path == null || path.isEmpty) return root;
     final parts = path.split('/');
-    dynamic cursor = root;
+    dynamic cur = root;
     for (final p in parts) {
-      if (cursor == null) return null;
-      if (cursor is Map<String, dynamic>)
-        cursor = cursor[p];
-      else if (cursor is List) {
+      if (cur == null) return null;
+      if (cur is Map<String, dynamic>) {
+        cur = cur[p];
+      } else if (cur is List) {
         final idx = int.tryParse(p);
-        if (idx == null) return null;
-        if (idx < 0 || idx >= cursor.length) return null;
-        cursor = cursor[idx];
+        if (idx == null || idx < 0 || idx >= cur.length) return null;
+        cur = cur[idx];
       } else
         return null;
     }
-    return cursor;
+    return cur;
   }
 
   bool setNode(String path, dynamic value) {
     if (path.isEmpty) return false;
     final parts = path.split('/');
-    dynamic cursor = root;
+    dynamic cur = root;
     for (int i = 0; i < parts.length - 1; i++) {
       final p = parts[i];
-      if (cursor is Map<String, dynamic>)
-        cursor = cursor[p];
-      else if (cursor is List)
-        cursor = cursor[int.parse(p)];
-      else
+      if (cur is Map<String, dynamic>)
+        cur = cur[p];
+      else if (cur is List) {
+        final idx = int.tryParse(p);
+        if (idx == null) return false;
+        cur = cur[idx];
+      } else
         return false;
     }
     final last = parts.last;
-    if (cursor is Map<String, dynamic>) {
-      cursor[last] = value;
+    if (cur is Map<String, dynamic>) {
+      cur[last] = value;
       return true;
-    } else if (cursor is List) {
+    } else if (cur is List) {
       final idx = int.tryParse(last);
-      if (idx == null) return false;
-      if (idx < 0 || idx >= cursor.length) return false;
-      cursor[idx] = value;
+      if (idx == null || idx < 0 || idx >= cur.length) return false;
+      cur[idx] = value;
       return true;
     }
     return false;
@@ -94,30 +89,27 @@ class JsonNavigator {
   }
 
   bool deleteNode(String path) {
+    if (path.isEmpty) return false;
     final parts = path.split('/');
-    if (parts.isEmpty) return false;
-
-    dynamic parent = root;
+    dynamic cur = root;
     for (int i = 0; i < parts.length - 1; i++) {
       final p = parts[i];
-      if (parent is Map) {
-        parent = parent[p];
-      } else if (parent is List) {
+      if (cur is Map<String, dynamic>)
+        cur = cur[p];
+      else if (cur is List) {
         final idx = int.tryParse(p);
-        if (idx == null || idx < 0 || idx >= parent.length) return false;
-        parent = parent[idx];
-      } else {
+        if (idx == null) return false;
+        cur = cur[idx];
+      } else
         return false;
-      }
     }
-
     final last = parts.last;
-    if (parent is Map) {
-      return parent.remove(last) != null;
-    } else if (parent is List) {
+    if (cur is Map<String, dynamic>) {
+      return cur.remove(last) != null;
+    } else if (cur is List) {
       final idx = int.tryParse(last);
-      if (idx == null || idx < 0 || idx >= parent.length) return false;
-      parent.removeAt(idx);
+      if (idx == null || idx < 0 || idx >= cur.length) return false;
+      cur.removeAt(idx);
       return true;
     }
     return false;
@@ -126,12 +118,10 @@ class JsonNavigator {
   bool renameNode(String path, String newKey) {
     final parts = path.split('/');
     if (parts.length < 2) return false;
-
     final key = parts.last;
-    final parentPath = parts.take(parts.length - 1).join('/');
+    final parentPath = parts.sublist(0, parts.length - 1).join('/');
     final parent = getNode(parentPath);
-    if (parent is! Map) return false;
-
+    if (parent is! Map<String, dynamic>) return false;
     final val = parent.remove(key);
     if (val == null) return false;
     parent[newKey] = val;
@@ -141,37 +131,33 @@ class JsonNavigator {
   bool duplicateNode(String path) {
     final node = getNode(path);
     if (node == null) return false;
-
     final parts = path.split('/');
-    if (parts.isEmpty) return false;
-
     dynamic parent = root;
     for (int i = 0; i < parts.length - 1; i++) {
       final p = parts[i];
-      if (parent is Map) {
+      if (parent is Map<String, dynamic>)
         parent = parent[p];
-      } else if (parent is List) {
-        final idx = int.tryParse(p);
-        if (idx == null || idx < 0 || idx >= parent.length) return false;
-        parent = parent[idx];
-      } else {
+      else if (parent is List)
+        parent = parent[int.parse(p)];
+      else
         return false;
-      }
     }
-
     final last = parts.last;
-    if (parent is Map) {
-      final val = jsonDecode(jsonEncode(node)); // deep copy
-      parent['${last}_copy'] = val;
+    if (parent is Map<String, dynamic>) {
+      var copyKey = '${last}_copy';
+      var i = 1;
+      while (parent.containsKey(copyKey)) {
+        copyKey = '${last}_copy$i';
+        i++;
+      }
+      parent[copyKey] = jsonDecode(jsonEncode(node));
       return true;
     } else if (parent is List) {
       final idx = int.tryParse(last);
       if (idx == null || idx < 0 || idx >= parent.length) return false;
-      final val = jsonDecode(jsonEncode(node)); // deep copy
-      parent.insert(idx + 1, val);
+      parent.insert(idx + 1, jsonDecode(jsonEncode(node)));
       return true;
     }
-
     return false;
   }
 }
@@ -184,36 +170,40 @@ class BDUIStage2Page extends StatefulWidget {
 
 class _BDUIStage2PageState extends State<BDUIStage2Page>
     with TickerProviderStateMixin {
+  // The document model
   Map<String, dynamic> _root = {};
-  String? _selectedPath;
-  dynamic _selectedValue;
-  String? _editorPath; // node currently shown in visual editor
 
-  final TextEditingController _rawEditorController = TextEditingController();
-  final FocusNode _rawEditorFocusNode = FocusNode();
+  // selection/editor state
+  String? _selectedPath;
+  String?
+  _editorPath; // the node currently shown in Visual Editor and Inspector
+  dynamic _selectedValue;
+
+  // Controllers and scroll keys
   final Map<String, TextEditingController> _valueControllers = {};
   final Map<String, Timer?> _debounceTimers = {};
-  String _selectedJsonCache = '';
-
-  // global undo/redo
-  final List<String> _undoStack = [];
-  final List<String> _redoStack = [];
-  static const int _kHistoryLimit = 100;
-
-  // json editor local history
-  final List<String> _jsonEditHistory = [];
-  int _jsonEditIndex = -1;
-  Timer? _jsonHistoryDebounce;
-  static const int _kJsonHistoryLimit = 50;
-  bool _rawEditorDirty = false; // true when user edited JSON but not saved
-
   final Map<String, GlobalKey> _tileKeys = {};
   final Map<String, GlobalKey> _titleKeys = {};
   final ScrollController _sidebarScroll = ScrollController();
   final GlobalKey _sidebarRootKey = GlobalKey();
 
+  // Inspector raw editor controllers and history
+  final TextEditingController _rawEditorController = TextEditingController();
   final ScrollController _inspectorHController = ScrollController();
   final ScrollController _inspectorVController = ScrollController();
+  final FocusNode _rawEditorFocus = FocusNode();
+  bool _rawEditorDirty = false;
+
+  // local JSON editor history for Undo/Redo (inspector editor)
+  final List<String> _jsonEditHistory = [];
+  int _jsonEditIndex = -1;
+  Timer? _jsonHistoryDebounce;
+  static const int _kJsonHistoryLimit = 200;
+
+  // global undo/redo stacks for entire doc
+  final List<String> _undoStack = [];
+  final List<String> _redoStack = [];
+  static const int _kGlobalHistoryLimit = 200;
 
   late TabController _inspectorTabController;
 
@@ -221,20 +211,27 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
   void initState() {
     super.initState();
     _inspectorTabController = TabController(length: 2, vsync: this);
+    // sample initial document
+    _root = _sampleDocument();
+    _pushGlobalHistory(); // initial snapshot
+    _editorPath = ''; // root
+    _selectedPath = null;
+    _selectedValue = null;
+
+    // initialize raw editor
+    _setRawEditorFromEditorPath();
 
     _rawEditorController.addListener(() {
-      // if change triggered programmatically we don't mark dirty here
-      if (!_rawEditorFocusNode.hasFocus) return;
+      if (!_rawEditorFocus.hasFocus) return;
       _rawEditorDirty = true;
       _jsonHistoryDebounce?.cancel();
-      _jsonHistoryDebounce = Timer(const Duration(milliseconds: 700), () {
+      _jsonHistoryDebounce = Timer(const Duration(milliseconds: 600), () {
         _jsonPushHistory(_rawEditorController.text);
       });
     });
 
-    _rawEditorFocusNode.addListener(() {
-      if (!_rawEditorFocusNode.hasFocus) {
-        // focus lost -> attempt save
+    _rawEditorFocus.addListener(() {
+      if (!_rawEditorFocus.hasFocus) {
         _saveRawEditorIfDirty();
       }
     });
@@ -248,7 +245,6 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     _valueControllers.clear();
     _debounceTimers.clear();
     _rawEditorController.dispose();
-    _rawEditorFocusNode.dispose();
     _inspectorHController.dispose();
     _inspectorVController.dispose();
     _sidebarScroll.dispose();
@@ -256,19 +252,39 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     super.dispose();
   }
 
-  // ---------- history helpers ----------
-  void _pushHistory() {
+  // ---------------- sample ----------------
+  Map<String, dynamic> _sampleDocument() {
+    return {
+      "globalVariable": {
+        "selectedCategoryOnCategoryPage": {
+          "type": "String",
+          "defaultValue": "",
+        },
+        "selectedLocation": {"type": "String", "defaultValue": ""},
+      },
+      "pages": [
+        {
+          "pageName": "home",
+          "header": {"widgetRegister": "wrModernSearchBar"},
+        },
+        {"pageName": "category"},
+      ],
+    };
+  }
+
+  // ---------------- history ----------------
+  void _pushGlobalHistory() {
     try {
       final snap = const JsonEncoder.withIndent('  ').convert(_root);
       if (_undoStack.isEmpty || _undoStack.last != snap) {
         _undoStack.add(snap);
-        if (_undoStack.length > _kHistoryLimit) _undoStack.removeAt(0);
+        if (_undoStack.length > _kGlobalHistoryLimit) _undoStack.removeAt(0);
         _redoStack.clear();
       }
     } catch (_) {}
   }
 
-  void _undo() {
+  void _undoGlobal() {
     if (_undoStack.isEmpty) return;
     final current = const JsonEncoder.withIndent('  ').convert(_root);
     _redoStack.add(current);
@@ -277,19 +293,18 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       final parsed = jsonDecode(prev) as Map<String, dynamic>;
       setState(() {
         _root = parsed;
-        _editorPath = null;
+        _editorPath = '';
         _selectedPath = null;
         _selectedValue = null;
-        _rawEditorController.text = '';
-        _selectedJsonCache = '';
+        _setRawEditorFromEditorPath();
         _valueControllers.clear();
       });
     } catch (e) {
-      _showError('Undo failed: $e');
+      _showSnack('Undo failed: $e');
     }
   }
 
-  void _redo() {
+  void _redoGlobal() {
     if (_redoStack.isEmpty) return;
     final next = _redoStack.removeLast();
     _undoStack.add(const JsonEncoder.withIndent('  ').convert(_root));
@@ -297,25 +312,23 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       final parsed = jsonDecode(next) as Map<String, dynamic>;
       setState(() {
         _root = parsed;
-        _editorPath = null;
+        _editorPath = '';
         _selectedPath = null;
         _selectedValue = null;
-        _rawEditorController.text = '';
-        _selectedJsonCache = '';
+        _setRawEditorFromEditorPath();
         _valueControllers.clear();
       });
     } catch (e) {
-      _showError('Redo failed: $e');
+      _showSnack('Redo failed: $e');
     }
   }
 
-  // ---------- json editor local history ----------
+  // ---------------- json editor local history ----------------
   void _jsonPushHistory(String txt) {
     if (_jsonEditIndex >= 0 &&
         _jsonEditIndex < _jsonEditHistory.length &&
         _jsonEditHistory[_jsonEditIndex] == txt)
       return;
-    // drop everything after current index
     if (_jsonEditIndex < _jsonEditHistory.length - 1) {
       _jsonEditHistory.removeRange(_jsonEditIndex + 1, _jsonEditHistory.length);
     }
@@ -328,62 +341,52 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
   void _jsonUndo() {
     if (_jsonEditIndex <= 0) return;
     _jsonEditIndex--;
-    final txt = _jsonEditHistory[_jsonEditIndex];
-    _setRawEditorTextProgrammatic(txt);
+    _setRawEditorTextProgrammatic(_jsonEditHistory[_jsonEditIndex]);
   }
 
   void _jsonRedo() {
     if (_jsonEditIndex < 0 || _jsonEditIndex >= _jsonEditHistory.length - 1)
       return;
     _jsonEditIndex++;
-    final txt = _jsonEditHistory[_jsonEditIndex];
-    _setRawEditorTextProgrammatic(txt);
+    _setRawEditorTextProgrammatic(_jsonEditHistory[_jsonEditIndex]);
   }
 
   void _setRawEditorTextProgrammatic(String txt) {
-    // set text without marking dirty and without adding to json history
-    final hadFocus = _rawEditorFocusNode.hasFocus;
-    _rawEditorFocusNode.canRequestFocus = false;
+    final hadFocus = _rawEditorFocus.hasFocus;
+    _rawEditorFocus.canRequestFocus = false;
     _rawEditorController.text = txt;
     _rawEditorDirty = false;
-    // restore focus ability
-    _rawEditorFocusNode.canRequestFocus = true;
-    if (hadFocus) _rawEditorFocusNode.requestFocus();
+    _rawEditorFocus.canRequestFocus = true;
+    if (hadFocus) _rawEditorFocus.requestFocus();
   }
 
-  // ---------- IO ----------
-  void _loadJsonString(String txt, {bool pushHistory = true}) {
+  // ---------------- IO helpers ----------------
+  void _loadJsonString(String txt) {
     try {
-      final dynamic parsed = jsonDecode(txt);
+      final parsed = jsonDecode(txt);
       if (parsed is Map<String, dynamic>) {
-        if (pushHistory) _pushHistory();
+        _pushGlobalHistory();
         setState(() {
           _root = parsed;
+          _editorPath = '';
           _selectedPath = null;
           _selectedValue = null;
-          _editorPath = null;
-          _rawEditorController.clear();
           _valueControllers.clear();
-          _tileKeys.clear();
-          _titleKeys.clear();
-          _selectedJsonCache = '';
-          _jsonEditHistory.clear();
-          _jsonEditIndex = -1;
-          _rawEditorDirty = false;
+          _setRawEditorFromEditorPath();
         });
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('JSON loaded')));
+        _showSnack('JSON loaded');
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Root JSON must be an object')),
-        );
+        _showSnack('Root JSON must be an object');
       }
     } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('JSON parse error: $e')));
+      _showSnack('JSON parse error: $e');
     }
+  }
+
+  Future<void> _pasteAndLoadJson() async {
+    final txt = await _showPasteDialog();
+    if (txt == null || txt.trim().isEmpty) return;
+    _loadJsonString(txt);
   }
 
   Future<String?> _showPasteDialog() {
@@ -395,11 +398,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
             title: const Text('Paste BDUI JSON'),
             content: SizedBox(
               height: 300,
-              child: TextField(
-                controller: ctrl,
-                maxLines: null,
-                decoration: const InputDecoration(hintText: 'Paste JSON here'),
-              ),
+              child: TextField(controller: ctrl, maxLines: null),
             ),
             actions: [
               TextButton(
@@ -413,26 +412,6 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
             ],
           ),
     );
-  }
-
-  Future<void> _pasteAndLoadJson() async {
-    final text = await _showPasteDialog();
-    if (text == null || text.trim().isEmpty) return;
-    _loadJsonString(text);
-  }
-
-  void _loadSample() {
-    const sample =
-        '{"globalVariable":{"foo":{"type":"String","defaultValue":""}},"pages":[{"pageName":"home"}]}';
-    _loadJsonString(sample);
-  }
-
-  Future<void> _copyToClipboard() async {
-    final text = const JsonEncoder.withIndent('  ').convert(_root);
-    await Clipboard.setData(ClipboardData(text: text));
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('Config copied to clipboard')));
   }
 
   void _downloadJsonWeb() {
@@ -450,14 +429,19 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       anchor.click();
       anchor.remove();
       html.Url.revokeObjectUrl(url);
+      _showSnack('Download started');
     } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Download failed: $e')));
+      _showSnack('Download failed: $e');
     }
   }
 
-  // ---------- selection & scrolling ----------
+  Future<void> _copyToClipboard() async {
+    final txt = const JsonEncoder.withIndent('  ').convert(_root);
+    await Clipboard.setData(ClipboardData(text: txt));
+    _showSnack('Copied to clipboard');
+  }
+
+  // ---------------- selection / scroll ----------------
   void _selectPath(String path, {bool ensureCenter = true}) {
     final nav = JsonNavigator(_root);
     final val = nav.getNode(path);
@@ -465,16 +449,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       _selectedPath = path;
       _selectedValue = val;
       _editorPath = path;
-      // update raw editor programmatically only if user has not unsaved edits
-      final newText = const JsonEncoder.withIndent('  ').convert(val);
-      if (!_rawEditorDirty) {
-        _setRawEditorTextProgrammatic(newText);
-        // reset local json history
-        _jsonEditHistory.clear();
-        _jsonEditHistory.add(newText);
-        _jsonEditIndex = 0;
-      }
-      _selectedJsonCache = newText;
+      _setRawEditorFromEditorPath();
     });
 
     if (!ensureCenter) return;
@@ -491,6 +466,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         return;
       } catch (_) {}
     }
+
     WidgetsBinding.instance.addPostFrameCallback(
       (_) => _manualScrollToCenter(path),
     );
@@ -522,9 +498,9 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
   }
 
-  // ---------- tree building ----------
+  // ---------------- tree widget building ----------------
   Widget _buildTreeWidgets(Map<String, dynamic> map, [String parentPath = '']) {
-    final List<Widget> children = [];
+    final children = <Widget>[];
     map.forEach((k, v) {
       final currentPath = parentPath.isEmpty ? k : '$parentPath/$k';
       children.add(_buildNodeWidgetForValue(k, currentPath, v));
@@ -543,6 +519,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     if (value is Map<String, dynamic>) {
       return ExpansionTile(
         key: PageStorageKey(path),
+        leading: const SizedBox.shrink(),
         onExpansionChanged: (expanded) {
           if (expanded)
             WidgetsBinding.instance.addPostFrameCallback(
@@ -653,14 +630,14 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
   }
 
-  // ---------- visual inspector (drill-down) ----------
+  // ---------------- Visual Inspector (drill-down, non-recursive) ----------------
   Widget _buildVisualInspector() {
     if (_editorPath == null)
       return const Center(child: Text('No node selected'));
     final nav = JsonNavigator(_root);
     final node = nav.getNode(_editorPath!);
     final crumbs =
-        (_editorPath == null || _editorPath!.isEmpty)
+        _editorPath == null || _editorPath!.isEmpty
             ? <String>[]
             : _editorPath!.split('/');
 
@@ -670,7 +647,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         Wrap(
           children: [
             TextButton(
-              onPressed: () => setState(() => _editorPath = _selectedPath),
+              onPressed: () => setState(() => _editorPath = ''),
               child: const Text('root'),
             ),
             for (int i = 0; i < crumbs.length; i++) ...[
@@ -714,10 +691,25 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                     ),
                   ),
                   Tooltip(
-                    message: 'Delete this node',
-                    child: IconButton(
-                      onPressed: () => _deleteNodeConfirm(path),
-                      icon: const Icon(Icons.delete),
+                    message: 'Node actions',
+                    child: PopupMenuButton<String>(
+                      icon: const Icon(Icons.more_vert),
+                      onSelected:
+                          (v) => _handleNodeMenuOnContainer(path, node, v),
+                      itemBuilder:
+                          (ctx) => const [
+                            PopupMenuItem(
+                              value: 'duplicate',
+                              child: Text('Duplicate'),
+                            ),
+                            PopupMenuItem(
+                              value: 'delete',
+                              child: Text(
+                                'Delete',
+                                style: TextStyle(color: Colors.red),
+                              ),
+                            ),
+                          ],
                     ),
                   ),
                 ],
@@ -762,10 +754,25 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                     ),
                   ),
                   Tooltip(
-                    message: 'Delete this node',
-                    child: IconButton(
-                      onPressed: () => _deleteNodeConfirm(path),
-                      icon: const Icon(Icons.delete),
+                    message: 'Node actions',
+                    child: PopupMenuButton<String>(
+                      icon: const Icon(Icons.more_vert),
+                      onSelected:
+                          (v) => _handleNodeMenuOnContainer(path, list, v),
+                      itemBuilder:
+                          (ctx) => const [
+                            PopupMenuItem(
+                              value: 'duplicate',
+                              child: Text('Duplicate'),
+                            ),
+                            PopupMenuItem(
+                              value: 'delete',
+                              child: Text(
+                                'Delete',
+                                style: TextStyle(color: Colors.red),
+                              ),
+                            ),
+                          ],
                     ),
                   ),
                 ],
@@ -793,6 +800,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       );
     }
 
+    // primitive value
     return Padding(
       padding: const EdgeInsets.all(8),
       child: Column(
@@ -862,12 +870,10 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         ),
       );
     }
-
     final subtitle =
         value is Map
             ? 'Map (${(value as Map).length} keys)'
             : 'List (${(value as List).length} items)';
-
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 6),
       child: ListTile(
@@ -948,7 +954,6 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         ),
       );
     }
-
     final subtitle =
         value is Map
             ? 'Map (${(value as Map).length} keys)'
@@ -981,6 +986,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
   }
 
+  // ---------------- Map/List node menu handlers ----------------
   void _handleNodeMenuMap(
     Map parentMap,
     String key,
@@ -993,7 +999,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         setState(() => _editorPath = path);
         break;
       case 'duplicate':
-        _pushHistory();
+        _pushGlobalHistory();
         final val = parentMap[key];
         var newKey = '${key}_copy';
         var i = 1;
@@ -1026,10 +1032,10 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         );
         if (res == true) {
           final newKey = ctrl.text.trim();
-          if (newKey.isEmpty) return _showError('Key required');
+          if (newKey.isEmpty) return _showSnack('Key required');
           if (newKey == key) return;
-          if (parentMap.containsKey(newKey)) return _showError('Key exists');
-          _pushHistory();
+          if (parentMap.containsKey(newKey)) return _showSnack('Key exists');
+          _pushGlobalHistory();
           final val = parentMap.remove(key);
           parentMap[newKey] = val;
           setState(() {});
@@ -1055,7 +1061,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               ),
         );
         if (ok == true) {
-          _pushHistory();
+          _pushGlobalHistory();
           parentMap.remove(key);
           setState(() {});
         }
@@ -1074,14 +1080,14 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         setState(() => _editorPath = path);
         break;
       case 'duplicate':
-        _pushHistory();
+        _pushGlobalHistory();
         final val = parentList[idx];
         parentList.insert(idx + 1, jsonDecode(jsonEncode(val)));
         setState(() {});
         break;
       case 'moveUp':
         if (idx > 0) {
-          _pushHistory();
+          _pushGlobalHistory();
           final tmp = parentList[idx - 1];
           parentList[idx - 1] = parentList[idx];
           parentList[idx] = tmp;
@@ -1090,7 +1096,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         break;
       case 'moveDown':
         if (idx < parentList.length - 1) {
-          _pushHistory();
+          _pushGlobalHistory();
           final tmp = parentList[idx + 1];
           parentList[idx + 1] = parentList[idx];
           parentList[idx] = tmp;
@@ -1117,7 +1123,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               ),
         );
         if (ok == true) {
-          _pushHistory();
+          _pushGlobalHistory();
           parentList.removeAt(idx);
           setState(() {});
         }
@@ -1125,6 +1131,54 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     }
   }
 
+  void _handleNodeMenuOnContainer(
+    String path,
+    dynamic container,
+    String action,
+  ) async {
+    switch (action) {
+      case 'duplicate':
+        _pushGlobalHistory();
+        final nav = JsonNavigator(_root);
+        nav.duplicateNode(path);
+        setState(() {});
+        break;
+      case 'delete':
+        final ok = await showDialog<bool?>(
+          context: context,
+          builder:
+              (ctx) => AlertDialog(
+                title: const Text('Delete'),
+                content: Text('Delete $path?'),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, false),
+                    child: const Text('Cancel'),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, true),
+                    child: const Text('Delete'),
+                  ),
+                ],
+              ),
+        );
+        if (ok == true) {
+          _pushGlobalHistory();
+          final nav = JsonNavigator(_root);
+          nav.deleteNode(path);
+          setState(() {
+            // adjust editor/selection
+            final p = _parentPath(path) ?? '';
+            _selectedPath = p.isEmpty ? null : p;
+            _editorPath = p.isEmpty ? '' : p;
+            _setRawEditorFromEditorPath();
+          });
+        }
+        break;
+    }
+  }
+
+  // ---------------- primitive editors (immediate children only) ----------------
   TextEditingController _attachController(
     String path,
     String initial, {
@@ -1137,48 +1191,30 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     }
     final ctrl = TextEditingController(text: initial);
     _valueControllers[path] = ctrl;
-
-    // debounce changes to avoid heavy setState on every keystroke
     ctrl.addListener(() {
       _debounceTimers[path]?.cancel();
       _debounceTimers[path] = Timer(const Duration(milliseconds: 300), () {
-        _pushHistory();
+        _pushGlobalHistory();
         onChanged(ctrl.text);
-        // update inspector live
-        if (_editorPath != null) {
-          final nav = JsonNavigator(_root);
-          final current = nav.getNode(_editorPath!);
-          if (!_rawEditorDirty) {
-            final txt = const JsonEncoder.withIndent('  ').convert(current);
-            _setRawEditorTextProgrammatic(txt);
-            _jsonEditHistory.clear();
-            _jsonEditHistory.add(txt);
-            _jsonEditIndex = 0;
-          }
-          _rawEditorController.text = const JsonEncoder.withIndent(
-            '  ',
-          ).convert(current);
-          _selectedJsonCache = _rawEditorController.text;
+        // also reflect to inspector raw editor if appropriate
+        if (!_rawEditorDirty) {
+          _setRawEditorFromEditorPath();
         }
       });
     });
-
     return ctrl;
   }
 
   Widget _buildEditorForPrimitive(String path, dynamic value) {
-    if (value is bool)
+    if (value is bool) {
       return Tooltip(
         message: 'Toggle boolean',
         child: Switch(
           value: value,
-          onChanged: (v) {
-            _pushHistory();
-            _updatePrimitive(path, v);
-          },
+          onChanged: (v) => _updatePrimitive(path, v),
         ),
       );
-
+    }
     if (value is int) {
       final ctrl = _attachController(
         path,
@@ -1193,10 +1229,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           Tooltip(
             message: 'Decrease',
             child: IconButton(
-              onPressed: () {
-                _pushHistory();
-                _updatePrimitive(path, value - 1);
-              },
+              onPressed: () => _updatePrimitive(path, value - 1),
               icon: const Icon(Icons.remove),
             ),
           ),
@@ -1210,17 +1243,13 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           Tooltip(
             message: 'Increase',
             child: IconButton(
-              onPressed: () {
-                _pushHistory();
-                _updatePrimitive(path, value + 1);
-              },
+              onPressed: () => _updatePrimitive(path, value + 1),
               icon: const Icon(Icons.add),
             ),
           ),
         ],
       );
     }
-
     if (value is double) {
       final ctrl = _attachController(
         path,
@@ -1235,10 +1264,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           Tooltip(
             message: 'Decrease',
             child: IconButton(
-              onPressed: () {
-                _pushHistory();
-                _updatePrimitive(path, (value - 0.1));
-              },
+              onPressed: () => _updatePrimitive(path, (value - 0.1)),
               icon: const Icon(Icons.remove),
             ),
           ),
@@ -1254,18 +1280,14 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           Tooltip(
             message: 'Increase',
             child: IconButton(
-              onPressed: () {
-                _pushHistory();
-                _updatePrimitive(path, (value + 0.1));
-              },
+              onPressed: () => _updatePrimitive(path, (value + 0.1)),
               icon: const Icon(Icons.add),
             ),
           ),
         ],
       );
     }
-
-    // string or null
+    // string / null
     final ctrl = _attachController(
       path,
       value?.toString() ?? '',
@@ -1280,7 +1302,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           child: IconButton(
             onPressed: () {
               ctrl.clear();
-              _pushHistory();
+              _pushGlobalHistory();
               _updatePrimitive(path, '');
             },
             icon: const Icon(Icons.clear),
@@ -1290,17 +1312,13 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
   }
 
-  void _showError(String msg) =>
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-
   void _updatePrimitive(String path, dynamic newValue) {
     final nav = JsonNavigator(_root);
     final ok = nav.setNode(path, newValue);
     if (!ok) {
-      _showError('Failed to update value');
+      _showSnack('Failed to update value');
       return;
     }
-    // update inspector and selectedValue if relevant
     setState(() {
       if (_editorPath != null) {
         final current = nav.getNode(_editorPath!);
@@ -1312,15 +1330,12 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           _jsonEditIndex = 0;
         }
         _rawEditorController.text = txt;
-        _selectedJsonCache = _rawEditorController.text;
       }
-      if (_selectedPath != null) {
-        _selectedValue = nav.getNode(_selectedPath!);
-      }
+      if (_selectedPath != null) _selectedValue = nav.getNode(_selectedPath!);
     });
   }
 
-  // ---------- dialogs / add helpers ----------
+  // ---------------- add / rename / delete helpers ----------------
   Future<void> _addMapKeyDialog(String mapPath) async {
     final keyCtrl = TextEditingController();
     final typeCtrl = TextEditingController(text: 'string');
@@ -1371,7 +1386,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
     if (res != true) return;
     final k = keyCtrl.text.trim();
-    if (k.isEmpty) return _showError('Key required');
+    if (k.isEmpty) return _showSnack('Key required');
     final t = typeCtrl.text.trim();
     dynamic val;
     if (t == 'int')
@@ -1389,14 +1404,14 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     final nav = JsonNavigator(_root);
     final map = nav.getNode(mapPath);
     if (map is Map<String, dynamic>) {
-      if (map.containsKey(k)) return _showError('Key exists');
-      _pushHistory();
+      if (map.containsKey(k)) return _showSnack('Key exists');
+      _pushGlobalHistory();
       map[k] = val;
       setState(() {
         _valueControllers.removeWhere((p, c) => p.startsWith(mapPath));
       });
     } else
-      _showError('Target not map');
+      _showSnack('Target not map');
   }
 
   Future<void> _addListItemDialog(String listPath) async {
@@ -1460,9 +1475,9 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     final nav = JsonNavigator(_root);
     final ok = nav.insertIntoList(listPath, val);
     if (!ok)
-      _showError('Target is not a list');
+      _showSnack('Target is not a list');
     else {
-      _pushHistory();
+      _pushGlobalHistory();
       setState(() {
         _valueControllers.removeWhere((p, c) => p.startsWith(listPath));
       });
@@ -1473,6 +1488,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     final nav = JsonNavigator(_root);
     final list = nav.getNode(listPath);
     if (list is List && idx > 0) {
+      _pushGlobalHistory();
       final tmp = list[idx - 1];
       list[idx - 1] = list[idx];
       list[idx] = tmp;
@@ -1486,6 +1502,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     final nav = JsonNavigator(_root);
     final list = nav.getNode(listPath);
     if (list is List && idx < list.length - 1) {
+      _pushGlobalHistory();
       final tmp = list[idx + 1];
       list[idx + 1] = list[idx];
       list[idx] = tmp;
@@ -1495,7 +1512,8 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     }
   }
 
-  void _deleteNodeConfirm(String path) async {
+  // ---------------- delete / apply raw editor ----------------
+  Future<void> _deleteNodeConfirm(String path) async {
     final ok = await showDialog<bool?>(
       context: context,
       builder:
@@ -1517,25 +1535,14 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     if (ok != true) return;
     final nav = JsonNavigator(_root);
     final success = nav.deleteNode(path);
-    if (!success) return _showError('Delete failed');
+    if (!success) return _showSnack('Delete failed');
     final p = _parentPath(path) ?? '';
-    _pushHistory();
+    _pushGlobalHistory();
     setState(() {
       _selectedPath = p.isEmpty ? null : p;
       _selectedValue = p.isEmpty ? null : nav.getNode(p);
-      _editorPath = _selectedPath;
-      final txt =
-          _selectedValue == null
-              ? ''
-              : const JsonEncoder.withIndent('  ').convert(_selectedValue);
-      if (!_rawEditorDirty) {
-        _setRawEditorTextProgrammatic(txt);
-        _jsonEditHistory.clear();
-        _jsonEditHistory.add(txt);
-        _jsonEditIndex = 0;
-      }
-      _rawEditorController.text = txt;
-      _selectedJsonCache = _rawEditorController.text;
+      _editorPath = _selectedPath ?? '';
+      _setRawEditorFromEditorPath();
       _valueControllers.removeWhere(
         (k, v) => k.startsWith(path) || k.startsWith(p),
       );
@@ -1564,12 +1571,12 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
     if (ok != true) return;
     final newKey = ctrl.text.trim();
-    if (newKey.isEmpty) return _showError('Key required');
+    if (newKey.isEmpty) return _showSnack('Key required');
     final nav = JsonNavigator(_root);
     final map = nav.getNode(mapPath);
     if (map is Map<String, dynamic>) {
       final val = map.remove(key);
-      _pushHistory();
+      _pushGlobalHistory();
       map[newKey] = val;
       setState(() {
         _valueControllers.removeWhere((p, c) => p.startsWith(mapPath));
@@ -1583,7 +1590,10 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     return path.substring(0, idx);
   }
 
-  // ---------- raw editor save/apply ----------
+  void _applyRawEditor() {
+    _saveRawEditorIfDirty();
+  }
+
   Future<void> _saveRawEditorIfDirty() async {
     if (!_rawEditorDirty) return;
     if (_editorPath == null) return;
@@ -1591,7 +1601,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     try {
       final parsed = jsonDecode(text);
       final nav = JsonNavigator(_root);
-      _pushHistory();
+      _pushGlobalHistory();
       final ok = nav.setNode(_editorPath!, parsed);
       if (!ok) throw Exception('Apply failed');
       setState(() {
@@ -1602,80 +1612,54 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           _jsonEditHistory.clear();
           _jsonEditHistory.add(newText);
           _jsonEditIndex = 0;
-          _selectedJsonCache = newText;
         }
         if (_selectedPath != null) _selectedValue = nav.getNode(_selectedPath!);
         _rawEditorDirty = false;
       });
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Saved JSON to model')));
+      _showSnack('Applied raw JSON');
     } catch (e) {
-      _showError('Invalid JSON: $e');
+      _showSnack('Invalid JSON: $e');
     }
   }
 
-  void _applyRawEditor() {
-    // kept for compatibility: apply current raw editor immediately
-    _saveRawEditorIfDirty();
+  // ---------------- inspector sync helpers ----------------
+  void _setRawEditorFromEditorPath() {
+    final nav = JsonNavigator(_root);
+    final node =
+        _editorPath == null || _editorPath == ''
+            ? nav.root
+            : nav.getNode(_editorPath);
+    final display =
+        node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
+    if (!_rawEditorDirty) {
+      _setRawEditorTextProgrammatic(display);
+      _jsonEditHistory.clear();
+      _jsonEditHistory.add(display);
+      _jsonEditIndex = 0;
+    }
   }
 
-  // ---------- simple syntax highlighter ----------
-  TextSpan _highlightJson(String src) {
-    final children = <TextSpan>[];
-    final reg = RegExp(
-      r'(\"(\\\\.|[^\\\\\"])*\")|\\b(-?\\d+\\.?\\d*(?:[eE][+-]?\\d+)?)\\b|\\b(true|false|null)\\b|[{}\\[\\],:]',
-      multiLine: true,
-    );
-    int last = 0;
-    for (final m in reg.allMatches(src)) {
-      if (m.start > last)
-        children.add(
-          TextSpan(
-            text: src.substring(last, m.start),
-            style: const TextStyle(color: Colors.black),
-          ),
-        );
-      final tok = m.group(0)!;
-      if (tok.startsWith('\"')) {
-        children.add(
-          TextSpan(text: tok, style: const TextStyle(color: Color(0xFF6A8759))),
-        );
-      } else if (tok == 'true' || tok == 'false' || tok == 'null') {
-        children.add(
-          TextSpan(text: tok, style: const TextStyle(color: Color(0xFF9876AA))),
-        );
-      } else if (RegExp(r'^-?\\d').hasMatch(tok)) {
-        children.add(
-          TextSpan(text: tok, style: const TextStyle(color: Color(0xFF6897BB))),
-        );
+  void _syncJsonWithView() {
+    // when the raw editor text is changed by user we attempt live sync but tolerantly
+    try {
+      final parsed = jsonDecode(_rawEditorController.text);
+      final nav = JsonNavigator(_root);
+      if (_editorPath == null || _editorPath == '') {
+        if (parsed is Map<String, dynamic>) {
+          setState(() {
+            _root = parsed;
+          });
+        }
       } else {
-        children.add(
-          TextSpan(
-            text: tok,
-            style: const TextStyle(
-              color: Color(0xFFCC7832),
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        );
+        nav.setNode(_editorPath!, parsed);
+        setState(() {});
       }
-      last = m.end;
+    } catch (_) {
+      // ignore incomplete edits
     }
-    if (last < src.length)
-      children.add(
-        TextSpan(
-          text: src.substring(last),
-          style: const TextStyle(color: Colors.black),
-        ),
-      );
-    return TextSpan(
-      style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
-      children: children,
-    );
   }
 
-  // ---------- UI build ----------
+  // ---------------- UI build ----------------
   Widget _buildSidebar() {
     return Container(
       key: _sidebarRootKey,
@@ -1694,43 +1678,41 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                 Row(
                   children: [
                     Tooltip(
-                      message: 'Undo last document change',
+                      message: 'Undo last doc change',
                       child: IconButton(
-                        onPressed: _undo,
+                        onPressed: _undoGlobal,
                         icon: const Icon(Icons.undo),
                       ),
                     ),
                     Tooltip(
-                      message: 'Redo last undone document change',
+                      message: 'Redo last undone change',
                       child: IconButton(
-                        onPressed: _redo,
+                        onPressed: _redoGlobal,
                         icon: const Icon(Icons.redo),
                       ),
                     ),
                     Tooltip(
-                      message: 'Clear document',
-                      child: TextButton(
-                        onPressed: () {
-                          setState(() {
-                            _root = {};
-                            _selectedPath = null;
-                            _selectedValue = null;
-                            _editorPath = null;
-                            _rawEditorController.clear();
-                            _valueControllers.clear();
-                            _tileKeys.clear();
-                            _titleKeys.clear();
-                            _selectedJsonCache = '';
-                            _undoStack.clear();
-                            _redoStack.clear();
-                            _jsonEditHistory.clear();
-                            _jsonEditIndex = -1;
-                            _rawEditorDirty = false;
-                          });
-                        },
-                        child: const Text('Clear'),
+                      message: 'Paste JSON',
+                      child: IconButton(
+                        onPressed: _pasteAndLoadJson,
+                        icon: const Icon(Icons.paste),
                       ),
                     ),
+                    Tooltip(
+                      message: 'Copy to clipboard',
+                      child: IconButton(
+                        onPressed: _copyToClipboard,
+                        icon: const Icon(Icons.copy),
+                      ),
+                    ),
+                    if (kIsWeb)
+                      Tooltip(
+                        message: 'Download JSON',
+                        child: IconButton(
+                          onPressed: _downloadJsonWeb,
+                          icon: const Icon(Icons.download),
+                        ),
+                      ),
                   ],
                 ),
               ],
@@ -1740,17 +1722,11 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           Expanded(
             child:
                 _root.isEmpty
-                    ? const Center(
-                      child: Text(
-                        'No document loaded. Use Paste or Load Sample',
-                      ),
-                    )
+                    ? const Center(child: Text('No document loaded'))
                     : SingleChildScrollView(
                       controller: _sidebarScroll,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 8.0),
-                        child: _buildTreeWidgets(_root),
-                      ),
+                      padding: const EdgeInsets.symmetric(vertical: 8.0),
+                      child: _buildTreeWidgets(_root),
                     ),
           ),
         ],
@@ -1777,7 +1753,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                 Tooltip(
                   message: 'Validate document',
                   child: TextButton(
-                    onPressed: () => setState(() {}),
+                    onPressed: _validateDocument,
                     child: const Text('Validate'),
                   ),
                 ),
@@ -1808,20 +1784,11 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                                 message: 'Reset JSON editor to model',
                                 child: ElevatedButton(
                                   onPressed: () {
-                                    final nav = JsonNavigator(_root);
-                                    final val =
-                                        _editorPath == null
-                                            ? null
-                                            : nav.getNode(_editorPath!);
-                                    final txt =
-                                        val == null
-                                            ? ''
-                                            : const JsonEncoder.withIndent(
-                                              '  ',
-                                            ).convert(val);
-                                    _setRawEditorTextProgrammatic(txt);
+                                    _setRawEditorFromEditorPath();
                                     _jsonEditHistory.clear();
-                                    _jsonEditHistory.add(txt);
+                                    _jsonEditHistory.add(
+                                      _rawEditorController.text,
+                                    );
                                     _jsonEditIndex = 0;
                                     _rawEditorDirty = false;
                                   },
@@ -1839,42 +1806,12 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
   }
 
-  void _syncInspectorEditors() {
-    final nav = JsonNavigator(_root);
-    final node = nav.getNode(_editorPath);
-    final jsonText =
-        node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
-    _setRawEditorTextProgrammatic(jsonText);
-  }
-
-  /*void _setRawEditorTextProgrammatic(String text) {
-  _rawEditorController.text = text;
-  _rawEditorDirty = false;
-}*/
-
-  /*void _saveRawEditorIfDirty() {
-  if (!_rawEditorDirty) return;
-  try {
-    final parsed = jsonDecode(_rawEditorController.text);
-    final nav = JsonNavigator(_root);
-    _pushHistory();
-    if (_editorPath == null) {
-      _root = parsed;
-    } else {
-      nav.setNode(_editorPath!, parsed);
-    }
-    setState(() {
-      _rawEditorDirty = false;
-      _syncInspectorEditors();
-    });
-  } catch (e) {
-    _showError('Invalid JSON: $e');
-  }
-}*/
-
   Widget _buildInspector() {
     final nav = JsonNavigator(_root);
-    final node = nav.getNode(_editorPath);
+    final node =
+        _editorPath == null || _editorPath == ''
+            ? nav.root
+            : nav.getNode(_editorPath);
     final display =
         node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
 
@@ -1906,7 +1843,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                     child: TabBarView(
                       controller: _inspectorTabController,
                       children: [
-                        // --- Inspector View ---
+                        // View (syntax highlighted, both scroll axes)
                         Scrollbar(
                           controller: _inspectorVController,
                           thumbVisibility: true,
@@ -1925,47 +1862,40 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                             ),
                           ),
                         ),
-
-                        // --- JSON Editor ---
+                        // JSON Editor
                         Column(
                           children: [
                             Row(
                               mainAxisAlignment: MainAxisAlignment.end,
                               children: [
-                                Tooltip(
-                                  message: 'Undo last edit',
-                                  child: IconButton(
-                                    onPressed: _jsonUndo,
-                                    icon: const Icon(Icons.undo),
-                                  ),
+                                Tooltip(message: 'Undo edit'),
+                                IconButton(
+                                  onPressed: _jsonUndo,
+                                  icon: const Icon(Icons.undo),
                                 ),
-                                Tooltip(
-                                  message: 'Redo last edit',
-                                  child: IconButton(
-                                    onPressed: _jsonRedo,
-                                    icon: const Icon(Icons.redo),
-                                  ),
+                                Tooltip(message: 'Redo edit'),
+                                IconButton(
+                                  onPressed: _jsonRedo,
+                                  icon: const Icon(Icons.redo),
                                 ),
-                                Tooltip(
-                                  message: 'Save JSON changes',
-                                  child: IconButton(
-                                    onPressed: _saveRawEditorIfDirty,
-                                    icon: const Icon(Icons.save),
-                                  ),
+                                Tooltip(message: 'Save JSON'),
+                                IconButton(
+                                  onPressed: _saveRawEditorIfDirty,
+                                  icon: const Icon(Icons.save),
                                 ),
                                 PopupMenuButton<String>(
-                                  tooltip: 'More actions',
+                                  tooltip: 'Node actions',
                                   icon: const Icon(Icons.more_vert),
                                   onSelected: (v) {
                                     switch (v) {
                                       case 'delete':
-                                        _handleDeleteNode();
+                                        _handleDeleteFromInspector();
                                         break;
                                       case 'duplicate':
-                                        _handleDuplicateNode();
+                                        _handleDuplicateFromInspector();
                                         break;
                                       case 'rename':
-                                        _handleRenameNode();
+                                        _handleRenameFromInspector();
                                         break;
                                     }
                                   },
@@ -1999,7 +1929,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                                 },
                                 child: TextField(
                                   controller: _rawEditorController,
-                                  focusNode: _rawEditorFocusNode,
+                                  focusNode: _rawEditorFocus,
                                   maxLines: null,
                                   decoration: const InputDecoration(
                                     border: OutlineInputBorder(),
@@ -2013,6 +1943,49 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                                   },
                                 ),
                               ),
+                            ),
+                            const SizedBox(height: 8),
+                            Row(
+                              children: [
+                                ElevatedButton(
+                                  onPressed: () {
+                                    try {
+                                      final parsed = jsonDecode(
+                                        _rawEditorController.text,
+                                      );
+                                      final nav = JsonNavigator(_root);
+                                      final ok =
+                                          _editorPath == null ||
+                                                  _editorPath == ''
+                                              ? (parsed is Map<String, dynamic>)
+                                              : nav.setNode(
+                                                _editorPath!,
+                                                parsed,
+                                              );
+                                      if (!ok)
+                                        _showSnack('Apply failed');
+                                      else {
+                                        _pushGlobalHistory();
+                                        setState(() {
+                                          _rawEditorDirty = false;
+                                        });
+                                        _showSnack('Applied');
+                                      }
+                                    } catch (e) {
+                                      _showSnack('Invalid JSON: $e');
+                                    }
+                                  },
+                                  child: const Text('Apply JSON'),
+                                ),
+                                const SizedBox(width: 8),
+                                ElevatedButton(
+                                  onPressed: () {
+                                    _setRawEditorFromEditorPath();
+                                    _showSnack('Reset');
+                                  },
+                                  child: const Text('Reset'),
+                                ),
+                              ],
                             ),
                           ],
                         ),
@@ -2028,43 +2001,36 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
   }
 
-  // --- Synchronization logic ---
-  void _syncJsonWithView() {
-    try {
-      final parsed = jsonDecode(_rawEditorController.text);
-      final nav = JsonNavigator(_root);
-      if (_editorPath == null) {
-        if (parsed is Map<String, dynamic>) {
-          setState(() => _root = parsed);
-        }
-      } else {
-        nav.setNode(_editorPath!, parsed);
-        setState(() {});
-      }
-    } catch (_) {
-      // ignore invalid partial edits
-    }
+  // ---------------- inspector actions (top-right menu) ----------------
+  void _handleDeleteFromInspector() {
+    if (_editorPath == null || _editorPath == '') return;
+    _deleteNodeConfirm(_editorPath!);
   }
 
-  void _handleDeleteNode() {
-    if (_editorPath == null) return;
+  void _handleDuplicateFromInspector() {
+    if (_editorPath == null || _editorPath == '') return;
+    _pushGlobalHistory();
     final nav = JsonNavigator(_root);
-    nav.deleteNode(_editorPath!);
+    nav.duplicateNode(_editorPath!);
     setState(() {});
   }
 
-  void _promptRenameNode(String path) async {
-    final parts = path.split('/');
-    final oldName = parts.isNotEmpty ? parts.last : '';
-    final controller = TextEditingController(text: oldName);
+  void _handleRenameFromInspector() {
+    if (_editorPath == null || _editorPath == '') return;
+    _promptRenameNode(_editorPath!);
+  }
 
-    final newName = await showDialog<String>(
+  Future<void> _promptRenameNode(String path) async {
+    final parts = path.split('/');
+    final old = parts.isNotEmpty ? parts.last : '';
+    final ctrl = TextEditingController(text: old);
+    final res = await showDialog<String?>(
       context: context,
       builder:
           (ctx) => AlertDialog(
             title: const Text('Rename Node'),
             content: TextField(
-              controller: controller,
+              controller: ctrl,
               decoration: const InputDecoration(labelText: 'New name'),
             ),
             actions: [
@@ -2073,85 +2039,129 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                 child: const Text('Cancel'),
               ),
               TextButton(
-                onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+                onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
                 child: const Text('Rename'),
               ),
             ],
           ),
     );
+    if (res == null) return;
+    final newName = res.trim();
+    if (newName.isEmpty || newName == old) return;
+    final ok = JsonNavigator(_root).renameNode(path, newName);
+    if (!ok)
+      _showSnack('Rename failed');
+    else
+      setState(() {});
+  }
 
-    if (newName != null && newName.isNotEmpty && newName != oldName) {
-      final nav = JsonNavigator(_root);
-      final ok = nav.renameNode(path, newName);
-      if (!ok) {
-        _showError('Rename failed');
+  // ---------------- simple syntax highlighter ----------------
+  TextSpan _highlightJson(String src) {
+    final children = <TextSpan>[];
+    final reg = RegExp(
+      r'(\"(\\.|[^"\\])*?\")|(\b-?\d+\.?\d*(?:[eE][+-]?\d+)?\b)|\b(true|false|null)\b|[{}[\],:]',
+      multiLine: true,
+    );
+    int last = 0;
+    for (final m in reg.allMatches(src)) {
+      if (m.start > last)
+        children.add(
+          TextSpan(
+            text: src.substring(last, m.start),
+            style: const TextStyle(color: Colors.black),
+          ),
+        );
+      final tok = m.group(0)!;
+      if (tok.startsWith('"')) {
+        children.add(
+          TextSpan(text: tok, style: const TextStyle(color: Color(0xFF6A8759))),
+        );
+      } else if (tok == 'true' || tok == 'false' || tok == 'null') {
+        children.add(
+          TextSpan(text: tok, style: const TextStyle(color: Color(0xFF9876AA))),
+        );
+      } else if (RegExp(r'^-?\d').hasMatch(tok)) {
+        children.add(
+          TextSpan(text: tok, style: const TextStyle(color: Color(0xFF6897BB))),
+        );
       } else {
-        setState(() {});
+        children.add(
+          TextSpan(
+            text: tok,
+            style: const TextStyle(
+              color: Color(0xFFCC7832),
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        );
       }
+      last = m.end;
+    }
+    if (last < src.length)
+      children.add(
+        TextSpan(
+          text: src.substring(last),
+          style: const TextStyle(color: Colors.black),
+        ),
+      );
+    return TextSpan(
+      style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+      children: children,
+    );
+  }
+
+  // ---------------- utility / misc ----------------
+  void _showSnack(String msg) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+
+  void _validateDocument() {
+    try {
+      const JsonEncoder.withIndent('  ').convert(_root);
+      _showSnack('Document valid JSON');
+    } catch (e) {
+      _showSnack('Validation failed: $e');
     }
   }
 
-  void _handleDuplicateNode() {
-    if (_editorPath == null) return;
-    final nav = JsonNavigator(_root);
-    nav.duplicateNode(_editorPath!);
-    setState(() {});
-  }
-
-  void _handleRenameNode() {
-    if (_editorPath == null) return;
-    _promptRenameNode(_editorPath!);
-  }
-
+  // ---------------- build scaffold ----------------
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('BDUI Builder - Stage2.5 Final'),
+        title: const Text('BDUI Builder - Stage2.5'),
         actions: [
           Tooltip(message: 'Paste BDUI JSON'),
           IconButton(
             onPressed: _pasteAndLoadJson,
             icon: const Icon(Icons.paste),
-            tooltip: 'Paste JSON',
           ),
-          Tooltip(message: 'Load sample config'),
+          Tooltip(message: 'Load sample'),
           IconButton(
-            onPressed: _loadSample,
+            onPressed: () {
+              _loadJsonString(
+                const JsonEncoder.withIndent('  ').convert(_sampleDocument()),
+              );
+            },
             icon: const Icon(Icons.playlist_add_check),
-            tooltip: 'Load sample',
           ),
           Tooltip(message: 'Copy config to clipboard'),
-          IconButton(
-            onPressed: _copyToClipboard,
-            icon: const Icon(Icons.copy),
-            tooltip: 'Copy',
-          ),
-          Tooltip(message: 'Global Undo'),
-          IconButton(
-            onPressed: _undo,
-            icon: const Icon(Icons.undo),
-            tooltip: 'Undo',
-          ),
-          Tooltip(message: 'Global Redo'),
-          IconButton(
-            onPressed: _redo,
-            icon: const Icon(Icons.redo),
-            tooltip: 'Redo',
-          ),
+          IconButton(onPressed: _copyToClipboard, icon: const Icon(Icons.copy)),
+          Tooltip(message: 'Undo (global)'),
+          IconButton(onPressed: _undoGlobal, icon: const Icon(Icons.undo)),
+          Tooltip(message: 'Redo (global)'),
+          IconButton(onPressed: _redoGlobal, icon: const Icon(Icons.redo)),
           if (kIsWeb) Tooltip(message: 'Download JSON'),
           IconButton(
             onPressed: _downloadJsonWeb,
             icon: const Icon(Icons.download),
-            tooltip: 'Download',
           ),
         ],
       ),
       body: LayoutBuilder(
         builder: (context, constraints) {
           final maxWidth = constraints.maxWidth;
-          final leftWidth = (maxWidth * 0.26).clamp(240.0, 520.0);
-          final rightWidth = (maxWidth * 0.32).clamp(280.0, 640.0);
+          final leftWidth = (maxWidth * 0.28).clamp(240.0, 520.0);
+          final rightWidth = (maxWidth * 0.34).clamp(320.0, 720.0);
           return Row(
             children: [
               ConstrainedBox(
