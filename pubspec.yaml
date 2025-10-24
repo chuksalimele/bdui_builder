@@ -37,6 +37,8 @@ dependencies:
   provider: ^6.1.5+1
   flutter_json_viewer: ^1.0.1
   json_editor: ^0.0.8
+  flutter_code_editor: ^0.3.5
+  highlight: ^0.7.0
 
 dev_dependencies:
   flutter_test:

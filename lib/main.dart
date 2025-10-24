@@ -1,11 +1,27 @@
 // lib/main.dart
+// BDUI Builder - Stage 2.6 (restored, single-file)
+// Features:
+// - Load / paste / sample / copy / download (web) JSON config
+// - Sidebar document tree that lists every node (maps/lists/primitives).
+// - Select node -> visual inspector shows immediate children (primitive editors or container items).
+// - Popup menus for node actions: duplicate (placed below), move up, move down, rename, delete.
+// - Inspector panel with a View (syntax-highlighted read-only) and an editable toggle
+//   (same view toggles to editable TextField). Apply and Reset buttons below editor.
+// - Inspector JSON always synced to current visual editor model when model changes.
+// - Local JSON editor history (undo/redo) and global model undo/redo.
+// - Smart editors for primitives (int/double/bool/string).
+// - Auto-scroll/center sidebar nodes on selection.
+// Notes: This is a compact implementation focused on functionality and correctness.
+
 import 'dart:async';
 import 'dart:convert';
+import 'package:bdui_builder/json_editor_view.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+// web-only download
 // ignore: avoid_web_libraries_in_flutter
-import 'dart:html' as html; // only used if kIsWeb for download
+import 'dart:html' as html;
 
 void main() {
   runApp(const BDUIApp());
@@ -18,13 +34,13 @@ class BDUIApp extends StatelessWidget {
     return MaterialApp(
       title: 'BDUI Builder - Stage2.6',
       theme: ThemeData(useMaterial3: true),
-      home: const BDUIStage2Page(),
+      home: const Stage26Page(),
       debugShowCheckedModeBanner: false,
     );
   }
 }
 
-/// Simple navigator to get/set/delete nodes inside a nested Map/List structure
+/// Small navigator utility for JSON tree (map/list)
 class JsonNavigator {
   Map<String, dynamic> root;
   JsonNavigator(this.root);
@@ -34,7 +50,6 @@ class JsonNavigator {
     final parts = path.split('/');
     dynamic cur = root;
     for (final p in parts) {
-      if (cur == null) return null;
       if (cur is Map<String, dynamic>) {
         cur = cur[p];
       } else if (cur is List) {
@@ -56,11 +71,9 @@ class JsonNavigator {
       final p = parts[i];
       if (cur is Map<String, dynamic>)
         cur = cur[p];
-      else if (cur is List) {
-        final idx = int.tryParse(p);
-        if (idx == null) return false;
-        cur = cur[idx];
-      } else
+      else if (cur is List)
+        cur = cur[int.parse(p)];
+      else
         return false;
     }
     final last = parts.last;
@@ -79,10 +92,11 @@ class JsonNavigator {
   bool insertIntoList(String listPath, dynamic value, [int? atIndex]) {
     final list = getNode(listPath);
     if (list is List) {
-      if (atIndex == null)
+      if (atIndex == null || atIndex < 0 || atIndex > list.length) {
         list.add(value);
-      else
+      } else {
         list.insert(atIndex, value);
+      }
       return true;
     }
     return false;
@@ -113,23 +127,12 @@ class JsonNavigator {
     return false;
   }
 
-  bool renameNode(String path, String newKey) {
-    final parts = path.split('/');
-    if (parts.length < 2) return false;
-    final key = parts.last;
-    final parentPath = parts.sublist(0, parts.length - 1).join('/');
-    final parent = getNode(parentPath);
-    if (parent is! Map<String, dynamic>) return false;
-    final val = parent.remove(key);
-    if (val == null) return false;
-    parent[newKey] = val;
-    return true;
-  }
-
+  /// duplicate node and place duplicate directly below original
   bool duplicateNode(String path) {
     final node = getNode(path);
     if (node == null) return false;
     final parts = path.split('/');
+    if (parts.isEmpty) return false;
     dynamic parent = root;
     for (int i = 0; i < parts.length - 1; i++) {
       final p = parts[i];
@@ -141,61 +144,59 @@ class JsonNavigator {
         return false;
     }
     final last = parts.last;
+    final copy = jsonDecode(jsonEncode(node)); // deep-copy
     if (parent is Map<String, dynamic>) {
-      // insert duplicate directly after original key
-      final entries = parent.entries.toList();
-      final idx = entries.indexWhere((e) => e.key == last);
-      if (idx == -1) return false;
-      final copyVal = jsonDecode(jsonEncode(node));
-      // find unique new key
-      var base = '${last}_copy';
-      var i = 1;
-      while (parent.containsKey(base)) {
-        base = '${last}_copy$i';
-        i++;
+      // place directly below: insert with a key like original_copy or original_copyN
+      var newKey = '${last}_copy';
+      var c = 1;
+      while (parent.containsKey(newKey)) {
+        newKey = '${last}_copy$c';
+        c++;
       }
-      entries.insert(idx + 1, MapEntry(base, copyVal));
+      // to place "below" in Map we rebuild map with insertion after key
+      final newMap = <String, dynamic>{};
+      parent.forEach((k, v) {
+        newMap[k] = v;
+        if (k == last) newMap[newKey] = copy;
+      });
       parent
         ..clear()
-        ..addEntries(entries);
+        ..addAll(newMap);
       return true;
     } else if (parent is List) {
       final idx = int.tryParse(last);
-      if (idx == null || idx < 0 || idx >= parent.length) return false;
-      final copyVal = jsonDecode(jsonEncode(node));
-      parent.insert(idx + 1, copyVal);
+      if (idx == null) return false;
+      parent.insert(idx + 1, copy);
       return true;
     }
     return false;
   }
 
-  /// Move a map child up or down by key order
-  bool moveMapEntryUp(String mapPath, String key) {
-    final node = getNode(mapPath);
-    if (node is! Map<String, dynamic>) return false;
-    final entries = node.entries.toList();
-    final idx = entries.indexWhere((e) => e.key == key);
-    if (idx > 0) {
-      final tmp = entries[idx - 1];
-      entries[idx - 1] = entries[idx];
-      entries[idx] = tmp;
-      node
-        ..clear()
-        ..addEntries(entries);
+  /// rename a key inside a map (path must refer to a child key of a map)
+  bool renameNode(String path, String newKey) {
+    if (!path.contains('/')) return false;
+    final parentPath = path.substring(0, path.lastIndexOf('/'));
+    final oldKey = path.substring(path.lastIndexOf('/') + 1);
+    final parent = getNode(parentPath);
+    if (parent is Map<String, dynamic>) {
+      if (!parent.containsKey(oldKey)) return false;
+      if (parent.containsKey(newKey)) return false;
+      final val = parent.remove(oldKey);
+      parent[newKey] = val;
       return true;
     }
     return false;
   }
 
-  bool moveMapEntryDown(String mapPath, String key) {
+  /// move key up/down within a Map. index must be valid and newPos computed.
+  bool moveMapKey(String mapPath, int index, int newPos) {
     final node = getNode(mapPath);
-    if (node is! Map<String, dynamic>) return false;
-    final entries = node.entries.toList();
-    final idx = entries.indexWhere((e) => e.key == key);
-    if (idx >= 0 && idx < entries.length - 1) {
-      final tmp = entries[idx + 1];
-      entries[idx + 1] = entries[idx];
-      entries[idx] = tmp;
+    if (node is Map<String, dynamic>) {
+      final entries = node.entries.toList();
+      if (index < 0 || index >= entries.length) return false;
+      if (newPos < 0 || newPos >= entries.length) return false;
+      final kv = entries.removeAt(index);
+      entries.insert(newPos, kv);
       node
         ..clear()
         ..addEntries(entries);
@@ -205,117 +206,77 @@ class JsonNavigator {
   }
 }
 
-class BDUIStage2Page extends StatefulWidget {
-  const BDUIStage2Page({super.key});
+class Stage26Page extends StatefulWidget {
+  const Stage26Page({super.key});
   @override
-  State<BDUIStage2Page> createState() => _BDUIStage2PageState();
+  State<Stage26Page> createState() => _Stage26PageState();
 }
 
-class _BDUIStage2PageState extends State<BDUIStage2Page>
+class _Stage26PageState extends State<Stage26Page>
     with TickerProviderStateMixin {
   Map<String, dynamic> _root = {};
-  String? _selectedPath;
-  dynamic _selectedValue;
-  String? _editorPath; // node shown in visual editor
-
-  // controllers
-  final TextEditingController _rawEditorController = TextEditingController();
-  final FocusNode _rawEditorFocusNode = FocusNode();
-  final Map<String, TextEditingController> _valueControllers = {};
-  final Map<String, Timer?> _debounceTimers = {};
-
-  // history
-  final List<String> _undoStack = [];
-  final List<String> _redoStack = [];
-  static const int _kHistoryLimit = 100;
-
-  // json editor local history (undo/redo inside inspector JSON)
-  final List<String> _jsonEditHistory = [];
-  int _jsonEditIndex = -1;
-  bool _rawEditorDirty = false; // user changed JSON but not saved
-
-  // UI keys and controllers
+  String? _selectedPath; // sidebar focus
+  String? _editorPath; // visual editor context (breadcrumbs)
   final Map<String, GlobalKey> _tileKeys = {};
   final Map<String, GlobalKey> _titleKeys = {};
   final ScrollController _sidebarScroll = ScrollController();
   final GlobalKey _sidebarRootKey = GlobalKey();
 
-  final ScrollController _inspectorHController = ScrollController();
-  final ScrollController _inspectorVController = ScrollController();
+  // inspector controllers
+  final TextEditingController _rawEditorController = TextEditingController();
+  final FocusNode _rawEditorFocus = FocusNode();
+  bool _inspectorEditable = false;
+  bool _rawEditorDirty = false;
 
-  late TabController _inspectorTabController;
+  // Inspector scroll controllers
+  final ScrollController _inspectorH = ScrollController();
+  final ScrollController _inspectorV = ScrollController();
+
+  // history
+  final List<String> _undoStack = [];
+  final List<String> _redoStack = [];
+  static const int _historyLimit = 100;
+
+  // json-editor local history (undo/redo)
+  final List<String> _jsonEditHistory = [];
+  int _jsonEditIndex = -1;
 
   @override
   void initState() {
     super.initState();
-    _inspectorTabController = TabController(length: 2, vsync: this);
-
-    // sample small root to start with
-    _root = {
-      "globalVariable": {
-        "x": {"type": "String", "defaultValue": ""},
-      },
-      "pages": [
-        {"pageName": "home"},
-      ],
-    };
-    // initialize raw editor to selected editor node (root initially)
-    _editorPath = null;
-    _setRawEditorFromEditorPath();
-
+    // load a sample automatically (small sample)
+    _loadSample();
     _rawEditorController.addListener(() {
-      // only mark dirty when user types (has focus)
-      if (_rawEditorFocusNode.hasFocus) {
-        _rawEditorDirty = true;
-        // push local history for JSON editor
-        final txt = _rawEditorController.text;
-        if (_jsonEditIndex < 0 ||
-            _jsonEditHistory.isEmpty ||
-            _jsonEditHistory[_jsonEditIndex] != txt) {
-          // trim forward history
-          if (_jsonEditIndex < _jsonEditHistory.length - 1) {
-            _jsonEditHistory.removeRange(
-              _jsonEditIndex + 1,
-              _jsonEditHistory.length,
-            );
-          }
-          _jsonEditHistory.add(txt);
-          if (_jsonEditHistory.length > 200) _jsonEditHistory.removeAt(0);
-          _jsonEditIndex = _jsonEditHistory.length - 1;
-        }
-      }
+      // mark dirty when user edits and only if inspector is editable
+      if (!_inspectorEditable) return;
+      _rawEditorDirty = true;
     });
-
-    _rawEditorFocusNode.addListener(() {
-      if (!_rawEditorFocusNode.hasFocus) {
-        // when focus leaves, we do NOT auto-apply. only save if user pressed Save/Apply.
-        // keep rawEditorDirty as-is
+    _rawEditorFocus.addListener(() {
+      if (!_rawEditorFocus.hasFocus) {
+        // when focus lost we DO NOT auto-apply (apply is manual)
+        // but ensure editor text stored in local json history
+        _pushJsonEditorHistory(_rawEditorController.text);
       }
     });
   }
 
   @override
   void dispose() {
-    _inspectorTabController.dispose();
-    for (final c in _valueControllers.values) c.dispose();
-    for (final t in _debounceTimers.values) t?.cancel();
-    _valueControllers.clear();
-    _debounceTimers.clear();
     _rawEditorController.dispose();
-    _rawEditorFocusNode.dispose();
-    _inspectorHController.dispose();
-    _inspectorVController.dispose();
+    _rawEditorFocus.dispose();
     _sidebarScroll.dispose();
+    _inspectorH.dispose();
+    _inspectorV.dispose();
     super.dispose();
   }
 
-  // ---------- history ----------
-  void _pushHistory() {
+  // ---------- helpers ----------
+  void _pushSnapshot() {
     try {
       final snap = const JsonEncoder.withIndent('  ').convert(_root);
       if (_undoStack.isEmpty || _undoStack.last != snap) {
         _undoStack.add(snap);
-        if (_undoStack.length > _kHistoryLimit) _undoStack.removeAt(0);
+        if (_undoStack.length > _historyLimit) _undoStack.removeAt(0);
         _redoStack.clear();
       }
     } catch (_) {}
@@ -323,21 +284,19 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
 
   void _undo() {
     if (_undoStack.isEmpty) return;
-    final current = const JsonEncoder.withIndent('  ').convert(_root);
-    _redoStack.add(current);
+    final cur = const JsonEncoder.withIndent('  ').convert(_root);
+    _redoStack.add(cur);
     final prev = _undoStack.removeLast();
     try {
       final parsed = jsonDecode(prev) as Map<String, dynamic>;
       setState(() {
         _root = parsed;
-        _editorPath = null;
         _selectedPath = null;
-        _selectedValue = null;
-        _setRawEditorFromEditorPath();
-        _valueControllers.clear();
+        _editorPath = null;
+        _syncInspectorToEditorPath();
       });
     } catch (e) {
-      _showError('Undo failed: $e');
+      _showSnack('Undo failed: $e');
     }
   }
 
@@ -349,61 +308,73 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       final parsed = jsonDecode(next) as Map<String, dynamic>;
       setState(() {
         _root = parsed;
-        _editorPath = null;
         _selectedPath = null;
-        _selectedValue = null;
-        _setRawEditorFromEditorPath();
-        _valueControllers.clear();
+        _editorPath = null;
+        _syncInspectorToEditorPath();
       });
     } catch (e) {
-      _showError('Redo failed: $e');
+      _showSnack('Redo failed: $e');
     }
+  }
+
+  void _pushJsonEditorHistory(String txt) {
+    if (txt.isEmpty && _jsonEditHistory.isEmpty) return;
+    if (_jsonEditIndex >= 0 &&
+        _jsonEditIndex < _jsonEditHistory.length &&
+        _jsonEditHistory[_jsonEditIndex] == txt)
+      return;
+    // drop any redo branch
+    if (_jsonEditIndex < _jsonEditHistory.length - 1) {
+      _jsonEditHistory.removeRange(_jsonEditIndex + 1, _jsonEditHistory.length);
+    }
+    _jsonEditHistory.add(txt);
+    if (_jsonEditHistory.length > 200) _jsonEditHistory.removeAt(0);
+    _jsonEditIndex = _jsonEditHistory.length - 1;
+  }
+
+  void _jsonEditorUndo() {
+    if (_jsonEditIndex <= 0) return;
+    _jsonEditIndex--;
+    _setInspectorTextProgrammatic(_jsonEditHistory[_jsonEditIndex]);
+  }
+
+  void _jsonEditorRedo() {
+    if (_jsonEditIndex < 0 || _jsonEditIndex >= _jsonEditHistory.length - 1)
+      return;
+    _jsonEditIndex++;
+    _setInspectorTextProgrammatic(_jsonEditHistory[_jsonEditIndex]);
+  }
+
+  void _setInspectorTextProgrammatic(String txt) {
+    //debugPrint('setInspectorTextProgrammatic');
+    final hadFocus = _rawEditorFocus.hasFocus;
+    _rawEditorFocus.canRequestFocus = false;
+    _rawEditorController.text = txt;
+    _rawEditorDirty = false;
+    _pushJsonEditorHistory(txt);
+    _rawEditorFocus.canRequestFocus = true;
+    if (hadFocus) _rawEditorFocus.requestFocus();
+  }
+
+  void _showSnack(String msg) {
+    // safe call in build context
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ScaffoldMessenger.of(context).removeCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    });
   }
 
   // ---------- IO ----------
-  void _loadJsonString(String txt, {bool pushHistory = true}) {
-    try {
-      final dynamic parsed = jsonDecode(txt);
-      if (parsed is Map<String, dynamic>) {
-        if (pushHistory) _pushHistory();
-        setState(() {
-          _root = parsed;
-          _selectedPath = null;
-          _selectedValue = null;
-          _editorPath = null;
-          _valueControllers.clear();
-          _tileKeys.clear();
-          _titleKeys.clear();
-          _setRawEditorFromEditorPath();
-          _rawEditorDirty = false;
-          _jsonEditHistory.clear();
-          _jsonEditIndex = -1;
-        });
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('JSON loaded')));
-      } else {
-        _showError('Root JSON must be an object');
-      }
-    } catch (e) {
-      _showError('JSON parse error: $e');
-    }
-  }
-
-  Future<void> _pasteAndLoadJson() async {
+  Future<String?> _pasteDialog() {
     final ctrl = TextEditingController();
-    final text = await showDialog<String?>(
+    return showDialog<String?>(
       context: context,
       builder:
           (ctx) => AlertDialog(
-            title: const Text('Paste BDUI JSON'),
+            title: const Text('Paste JSON'),
             content: SizedBox(
-              height: 300,
-              child: TextField(
-                controller: ctrl,
-                maxLines: null,
-                decoration: const InputDecoration(hintText: 'Paste JSON here'),
-              ),
+              height: 260,
+              child: TextField(controller: ctrl, maxLines: null),
             ),
             actions: [
               TextButton(
@@ -417,57 +388,91 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
             ],
           ),
     );
-    if (text == null || text.trim().isEmpty) return;
-    _loadJsonString(text);
+  }
+
+  Future<void> _pasteAndLoad() async {
+    final txt = await _pasteDialog();
+    if (txt == null || txt.trim().isEmpty) return;
+    _loadJsonString(txt);
+  }
+
+  void _loadJsonString(String txt, {bool pushHistory = true}) {
+    try {
+      final parsed = jsonDecode(txt);
+      if (parsed is Map<String, dynamic>) {
+        if (pushHistory) _pushSnapshot();
+        setState(() {
+          _root = parsed;
+          _selectedPath = null;
+          _editorPath = null;
+          _syncInspectorToEditorPath();
+        });
+        _showSnack('JSON loaded');
+      } else {
+        _showSnack('Root must be an object');
+      }
+    } catch (e) {
+      _showSnack('Invalid JSON: $e');
+    }
   }
 
   void _loadSample() {
-    const sample =
-        '{"globalVariable":{"foo":{"type":"String","defaultValue":""}},"pages":[{"pageName":"home"}]}';
-    _loadJsonString(sample);
+    const sample = '''
+{
+  "globalVariable": {
+    "selectedCategoryOnCategoryPage": {"type": "String", "defaultValue": ""},
+    "selectedLocation": {"type": "String", "defaultValue": ""}
+  },
+  "pages": [
+    {"pageName": "home"},
+    {"pageName": "category"}
+  ]
+}
+''';
+    _loadJsonString(sample, pushHistory: false);
   }
 
   Future<void> _copyToClipboard() async {
-    final text = const JsonEncoder.withIndent('  ').convert(_root);
-    await Clipboard.setData(ClipboardData(text: text));
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('Config copied to clipboard')));
+    await Clipboard.setData(
+      ClipboardData(text: const JsonEncoder.withIndent('  ').convert(_root)),
+    );
+    _showSnack('Copied to clipboard');
   }
 
-  void _downloadJsonWeb() {
+  void _downloadWeb() {
     if (!kIsWeb) return;
     try {
       final str = const JsonEncoder.withIndent('  ').convert(_root);
       final bytes = utf8.encode(str);
       final blob = html.Blob([bytes]);
       final url = html.Url.createObjectUrlFromBlob(blob);
-      final anchor =
+      final a =
           html.document.createElement('a') as html.AnchorElement
             ..href = url
             ..download = 'bdui-config.json';
-      html.document.body?.append(anchor);
-      anchor.click();
-      anchor.remove();
+      html.document.body?.append(a);
+      a.click();
+      a.remove();
       html.Url.revokeObjectUrl(url);
+      _showSnack('Download started');
     } catch (e) {
-      _showError('Download failed: $e');
+      _showSnack('Download failed: $e');
     }
   }
 
-  // ---------- selection & scrolling ----------
+  // ---------- selection & sidebar scrolling ----------
   void _selectPath(String path, {bool ensureCenter = true}) {
     final nav = JsonNavigator(_root);
     final val = nav.getNode(path);
     setState(() {
       _selectedPath = path;
-      _selectedValue = val;
       _editorPath = path;
-      _setRawEditorFromEditorPath(); // always sync JSON editor with selected editor node
+      // inspector must always sync to model per your request:
+      final txt =
+          val == null ? '{}' : const JsonEncoder.withIndent('  ').convert(val);
+      _setInspectorTextProgrammatic(txt);
     });
-
     if (!ensureCenter) return;
-
     final titleKey = _titleKeys[path];
     if (titleKey != null && titleKey.currentContext != null) {
       try {
@@ -512,68 +517,62 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
   }
 
   // ---------- tree building ----------
-  Widget _buildTreeWidgets(Map<String, dynamic> map, [String parentPath = '']) {
-    final children = <Widget>[];
+  Widget _buildTreeWidgets(Map<String, dynamic> map, [String parent = '']) {
+    final List<Widget> items = [];
     map.forEach((k, v) {
-      final currentPath = parentPath.isEmpty ? k : '$parentPath/$k';
-      children.add(_buildNodeWidgetForValue(k, currentPath, v));
+      final path = parent.isEmpty ? k : '$parent/$k';
+      items.add(_buildNodeWidget(k, path, v));
     });
-    return Column(children: children);
+    return Column(children: items);
   }
 
-  Widget _buildNodeWidgetForValue(
-    String displayKey,
-    String path,
-    dynamic value,
-  ) {
+  Widget _buildNodeWidget(String label, String path, dynamic value) {
     final tileKey = _tileKeys.putIfAbsent(path, () => GlobalKey());
     final titleKey = _titleKeys.putIfAbsent(path, () => GlobalKey());
-
     if (value is Map<String, dynamic>) {
       return ExpansionTile(
         key: PageStorageKey(path),
         onExpansionChanged: (expanded) {
           if (expanded)
             WidgetsBinding.instance.addPostFrameCallback(
-              (_) => _selectPath(path, ensureCenter: true),
+              (_) => _selectPath(path),
             );
         },
         title: GestureDetector(
           key: titleKey,
           onTap: () => _selectPath(path),
-          child: _tileTitle(displayKey, path, isContainer: true),
+          child: _tileTitle(label, path, isContainer: true),
         ),
         children: [
           Padding(
-            padding: const EdgeInsets.only(left: 12.0),
+            padding: const EdgeInsets.only(left: 12),
             child: _buildTreeWidgets(value, path),
           ),
         ],
       );
     } else if (value is List) {
-      final items = <Widget>[];
+      final children = <Widget>[];
       for (int i = 0; i < value.length; i++) {
         final childPath = '$path/$i';
-        final childDisplay = '$displayKey[$i]';
-        items.add(_buildNodeWidgetForValue(childDisplay, childPath, value[i]));
+        children.add(_buildNodeWidget('$label[$i]', childPath, value[i]));
       }
       return ExpansionTile(
         key: PageStorageKey(path),
         onExpansionChanged: (expanded) {
           if (expanded)
             WidgetsBinding.instance.addPostFrameCallback(
-              (_) => _selectPath(path, ensureCenter: true),
+              (_) => _selectPath(path),
             );
         },
         title: GestureDetector(
           key: titleKey,
           onTap: () => _selectPath(path),
-          child: _tileTitle('$displayKey [List]', path, isContainer: true),
+          child: _tileTitle('$label [List]', path, isContainer: true),
         ),
         children: [
           Padding(
-            padding: const EdgeInsets.only(left: 12.0),
-            child: Column(children: items),
+            padding: const EdgeInsets.only(left: 12),
+            child: Column(children: children),
           ),
         ],
       );
@@ -583,7 +582,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         title: GestureDetector(
           key: titleKey,
           onTap: () => _selectPath(path),
-          child: _tileTitle(displayKey, path, value: value),
+          child: _tileTitle(label, path, value: value),
         ),
         onTap: () => _selectPath(path),
       );
@@ -596,11 +595,11 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     dynamic value,
     bool isContainer = false,
   }) {
-    final selected = _selectedPath == path;
+    final sel = _selectedPath == path;
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
       decoration: BoxDecoration(
-        color: selected ? Colors.blue.shade50 : Colors.transparent,
+        color: sel ? Colors.blue.shade50 : Colors.transparent,
         borderRadius: BorderRadius.circular(6),
       ),
       child: Row(
@@ -612,16 +611,15 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                   Icon(
                     Icons.folder,
                     size: 16,
-                    color: selected ? Colors.blue.shade700 : Colors.grey,
+                    color: sel ? Colors.blue.shade700 : Colors.grey,
                   ),
                 if (isContainer) const SizedBox(width: 6),
                 Flexible(
                   child: Text(
                     label,
                     style: TextStyle(
-                      fontWeight:
-                          selected ? FontWeight.w600 : FontWeight.normal,
-                      color: selected ? Colors.blue.shade900 : Colors.black,
+                      fontWeight: sel ? FontWeight.w600 : FontWeight.normal,
+                      color: sel ? Colors.blue.shade900 : Colors.black,
                     ),
                   ),
                 ),
@@ -630,7 +628,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           ),
           if (value != null)
             ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 120),
+              constraints: BoxConstraints(maxWidth: 120),
               child: Text(
                 value.toString(),
                 style: const TextStyle(color: Colors.grey, fontSize: 12),
@@ -648,11 +646,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
       return const Center(child: Text('No node selected'));
     final nav = JsonNavigator(_root);
     final node = nav.getNode(_editorPath!);
-    final crumbs =
-        (_editorPath == null || _editorPath!.isEmpty)
-            ? <String>[]
-            : _editorPath!.split('/');
-
+    final crumbs = _editorPath!.split('/');
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -675,12 +669,12 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           ],
         ),
         const SizedBox(height: 8),
-        Expanded(child: _buildImmediateChildrenEditor(_editorPath!, node)),
+        Expanded(child: _buildImmediateEditor(_editorPath!, node)),
       ],
     );
   }
 
-  Widget _buildImmediateChildrenEditor(String path, dynamic node) {
+  Widget _buildImmediateEditor(String path, dynamic node) {
     if (node is Map<String, dynamic>) {
       final entries = node.entries.toList();
       return Column(
@@ -702,17 +696,24 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                       icon: const Icon(Icons.add),
                     ),
                   ),
-                  // replace delete icon with popup in header actions too
                   Tooltip(
                     message: 'More actions',
                     child: PopupMenuButton<String>(
                       icon: const Icon(Icons.more_vert),
-                      onSelected: (v) => _handleMapHeaderAction(path, v),
+                      onSelected: (v) => _handleMapNodeMenu(node, path, v),
                       itemBuilder:
                           (ctx) => const [
                             PopupMenuItem(
                               value: 'duplicate',
                               child: Text('Duplicate'),
+                            ),
+                            PopupMenuItem(
+                              value: 'moveUp',
+                              child: Text('Move Up'),
+                            ),
+                            PopupMenuItem(
+                              value: 'moveDown',
+                              child: Text('Move Down'),
                             ),
                             PopupMenuItem(
                               value: 'delete',
@@ -742,9 +743,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           ),
         ],
       );
-    }
-
-    if (node is List) {
+    } else if (node is List) {
       final list = node;
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -769,7 +768,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                     message: 'More actions',
                     child: PopupMenuButton<String>(
                       icon: const Icon(Icons.more_vert),
-                      onSelected: (v) => _handleListHeaderAction(path, v),
+                      onSelected: (v) => _handleListNodeMenu(list, -1, path, v),
                       itemBuilder:
                           (ctx) => const [
                             PopupMenuItem(
@@ -809,19 +808,19 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           ),
         ],
       );
+    } else {
+      return Padding(
+        padding: const EdgeInsets.all(8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Value at $path'),
+            const SizedBox(height: 8),
+            _primitiveEditor(path, node),
+          ],
+        ),
+      );
     }
-
-    return Padding(
-      padding: const EdgeInsets.all(8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('Value at $path'),
-          const SizedBox(height: 8),
-          _buildEditorForPrimitive(path, node),
-        ],
-      ),
-    );
   }
 
   Widget _immediateChildTileMapEntry(
@@ -845,13 +844,13 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
             children: [
               Expanded(child: Text(label)),
               const SizedBox(width: 12),
-              Expanded(child: _buildEditorForPrimitive(childPath, value)),
+              Expanded(child: _primitiveEditor(childPath, value)),
               Tooltip(
                 message: 'More actions',
                 child: PopupMenuButton<String>(
                   icon: const Icon(Icons.more_vert),
                   onSelected:
-                      (v) => _handleNodeMenuMap(
+                      (v) => _handleMapChildMenu(
                         parentMap,
                         key,
                         index,
@@ -885,7 +884,6 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         ),
       );
     }
-
     final subtitle =
         value is Map
             ? 'Map (${(value as Map).length} keys)'
@@ -900,7 +898,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           child: PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
             onSelected:
-                (v) => _handleNodeMenuMap(parentMap, key, index, childPath, v),
+                (v) => _handleMapChildMenu(parentMap, key, index, childPath, v),
             itemBuilder:
                 (ctx) => const [
                   PopupMenuItem(value: 'open', child: Text('Open')),
@@ -939,13 +937,14 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
             children: [
               Expanded(child: Text(label)),
               const SizedBox(width: 12),
-              Expanded(child: _buildEditorForPrimitive(childPath, value)),
+              Expanded(child: _primitiveEditor(childPath, value)),
               Tooltip(
                 message: 'More actions',
                 child: PopupMenuButton<String>(
                   icon: const Icon(Icons.more_vert),
                   onSelected:
-                      (v) => _handleNodeMenuList(parentList, idx, childPath, v),
+                      (v) =>
+                          _handleListChildMenu(parentList, idx, childPath, v),
                   itemBuilder:
                       (ctx) => const [
                         PopupMenuItem(
@@ -972,7 +971,6 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
         ),
       );
     }
-
     final subtitle =
         value is Map
             ? 'Map (${(value as Map).length} keys)'
@@ -987,7 +985,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           child: PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
             onSelected:
-                (v) => _handleNodeMenuList(parentList, idx, childPath, v),
+                (v) => _handleListChildMenu(parentList, idx, childPath, v),
             itemBuilder:
                 (ctx) => const [
                   PopupMenuItem(value: 'open', child: Text('Open')),
@@ -1005,104 +1003,67 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
   }
 
-  // ---------- editors for primitive values ----------
-  TextEditingController _attachController(
-    String path,
-    String initial, {
-    required ValueChanged<String> onChanged,
-  }) {
-    final existing = _valueControllers[path];
-    if (existing != null) {
-      if (existing.text != initial) existing.text = initial;
-      return existing;
-    }
-    final ctrl = TextEditingController(text: initial);
-    _valueControllers[path] = ctrl;
-    ctrl.addListener(() {
-      _debounceTimers[path]?.cancel();
-      _debounceTimers[path] = Timer(const Duration(milliseconds: 300), () {
-        _pushHistory();
-        onChanged(ctrl.text);
-        // always sync inspector JSON view after a primitive change
-        _setRawEditorFromEditorPath(); // editor node changed -> update raw editor content immediately
-      });
-    });
-    return ctrl;
-  }
-
-  Widget _buildEditorForPrimitive(String path, dynamic value) {
-    if (value is bool)
-      return Tooltip(
-        message: 'Toggle boolean',
-        child: Switch(
-          value: value,
-          onChanged: (v) {
-            _pushHistory();
-            _updatePrimitive(path, v);
-          },
-        ),
-      );
-    if (value is int) {
-      final ctrl = _attachController(
-        path,
-        value.toString(),
-        onChanged: (s) {
-          final n = int.tryParse(s);
-          if (n != null) _updatePrimitive(path, n);
+  // primitive editor: int/double/bool/string/null
+  Widget _primitiveEditor(String path, dynamic value) {
+    if (value is bool) {
+      return Switch(
+        value: value,
+        onChanged: (v) {
+          _pushSnapshot();
+          JsonNavigator(_root).setNode(path, v);
+          setState(() {
+            _syncInspectorToEditorPath();
+          });
         },
       );
+    } else if (value is int) {
+      final ctrl = TextEditingController(text: value.toString());
       return Row(
         children: [
-          Tooltip(
-            message: 'Decrease',
-            child: IconButton(
-              onPressed: () {
-                _pushHistory();
-                _updatePrimitive(path, value - 1);
-              },
-              icon: const Icon(Icons.remove),
-            ),
+          IconButton(
+            icon: const Icon(Icons.remove),
+            onPressed: () {
+              _pushSnapshot();
+              JsonNavigator(_root).setNode(path, value - 1);
+              setState(() => _syncInspectorToEditorPath());
+            },
           ),
           SizedBox(
             width: 120,
             child: TextField(
               controller: ctrl,
               keyboardType: TextInputType.number,
+              onSubmitted: (s) {
+                final n = int.tryParse(s);
+                if (n != null) {
+                  _pushSnapshot();
+                  JsonNavigator(_root).setNode(path, n);
+                  setState(() => _syncInspectorToEditorPath());
+                }
+              },
             ),
           ),
-          Tooltip(
-            message: 'Increase',
-            child: IconButton(
-              onPressed: () {
-                _pushHistory();
-                _updatePrimitive(path, value + 1);
-              },
-              icon: const Icon(Icons.add),
-            ),
+          IconButton(
+            icon: const Icon(Icons.add),
+            onPressed: () {
+              _pushSnapshot();
+              JsonNavigator(_root).setNode(path, value + 1);
+              setState(() => _syncInspectorToEditorPath());
+            },
           ),
         ],
       );
-    }
-    if (value is double) {
-      final ctrl = _attachController(
-        path,
-        value.toString(),
-        onChanged: (s) {
-          final n = double.tryParse(s);
-          if (n != null) _updatePrimitive(path, n);
-        },
-      );
+    } else if (value is double) {
+      final ctrl = TextEditingController(text: value.toString());
       return Row(
         children: [
-          Tooltip(
-            message: 'Decrease',
-            child: IconButton(
-              onPressed: () {
-                _pushHistory();
-                _updatePrimitive(path, (value - 0.1));
-              },
-              icon: const Icon(Icons.remove),
-            ),
+          IconButton(
+            icon: const Icon(Icons.remove),
+            onPressed: () {
+              _pushSnapshot();
+              JsonNavigator(_root).setNode(path, (value - 0.1));
+              setState(() => _syncInspectorToEditorPath());
+            },
           ),
           SizedBox(
             width: 140,
@@ -1111,354 +1072,181 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               keyboardType: const TextInputType.numberWithOptions(
                 decimal: true,
               ),
+              onSubmitted: (s) {
+                final n = double.tryParse(s);
+                if (n != null) {
+                  _pushSnapshot();
+                  JsonNavigator(_root).setNode(path, n);
+                  setState(() => _syncInspectorToEditorPath());
+                }
+              },
             ),
           ),
-          Tooltip(
-            message: 'Increase',
-            child: IconButton(
-              onPressed: () {
-                _pushHistory();
-                _updatePrimitive(path, (value + 0.1));
+          IconButton(
+            icon: const Icon(Icons.add),
+            onPressed: () {
+              _pushSnapshot();
+              JsonNavigator(_root).setNode(path, (value + 0.1));
+              setState(() => _syncInspectorToEditorPath());
+            },
+          ),
+        ],
+      );
+    } else {
+      // string or null
+      final ctrl = TextEditingController(text: value?.toString() ?? '');
+      return Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: ctrl,
+              onSubmitted: (s) {
+                _pushSnapshot();
+                JsonNavigator(_root).setNode(path, s);
+                setState(() => _syncInspectorToEditorPath());
               },
-              icon: const Icon(Icons.add),
             ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.clear),
+            onPressed: () {
+              _pushSnapshot();
+              JsonNavigator(_root).setNode(path, '');
+              setState(() => _syncInspectorToEditorPath());
+            },
           ),
         ],
       );
     }
-    // string or null
-    final ctrl = _attachController(
-      path,
-      value?.toString() ?? '',
-      onChanged: (s) => _updatePrimitive(path, s),
-    );
-    return Row(
-      children: [
-        Expanded(child: TextField(controller: ctrl)),
-        const SizedBox(width: 8),
-        Tooltip(
-          message: 'Clear',
-          child: IconButton(
-            onPressed: () {
-              ctrl.clear();
-              _pushHistory();
-              _updatePrimitive(path, '');
-            },
-            icon: const Icon(Icons.clear),
-          ),
-        ),
-      ],
-    );
   }
 
-  void _updatePrimitive(String path, dynamic newValue) {
-    final nav = JsonNavigator(_root);
-    final ok = nav.setNode(path, newValue);
-    if (!ok) {
-      _showError('Failed to update value');
-      return;
-    }
-    setState(() {
-      // Update selected value if relevant
-      if (_editorPath != null) {
-        final current = nav.getNode(_editorPath!);
-        // always update raw editor content to reflect model changes
-        _setRawEditorTextProgrammatic(
-          const JsonEncoder.withIndent('  ').convert(current),
-        );
-      }
-      if (_selectedPath != null) _selectedValue = nav.getNode(_selectedPath!);
-    });
-  }
-
-  // ---------- dialogs / add helpers ----------
-  Future<void> _addMapKeyDialog(String mapPath) async {
-    final keyCtrl = TextEditingController();
-    final typeCtrl = ValueNotifier<String>('string');
-    final valueCtrl = TextEditingController();
-    final res = await showDialog<bool?>(
-      context: context,
-      builder:
-          (ctx) => AlertDialog(
-            title: const Text('Add key'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: keyCtrl,
-                  decoration: const InputDecoration(labelText: 'Key'),
-                ),
-                ValueListenableBuilder<String>(
-                  valueListenable: typeCtrl,
-                  builder:
-                      (_, v, __) => DropdownButtonFormField<String>(
-                        value: v,
-                        items: const [
-                          DropdownMenuItem(
-                            value: 'string',
-                            child: Text('String'),
-                          ),
-                          DropdownMenuItem(value: 'int', child: Text('Int')),
-                          DropdownMenuItem(
-                            value: 'double',
-                            child: Text('Double'),
-                          ),
-                          DropdownMenuItem(value: 'bool', child: Text('Bool')),
-                          DropdownMenuItem(value: 'map', child: Text('Map')),
-                          DropdownMenuItem(value: 'list', child: Text('List')),
-                        ],
-                        onChanged: (vv) => typeCtrl.value = vv ?? 'string',
-                      ),
-                ),
-                TextField(
-                  controller: valueCtrl,
-                  decoration: const InputDecoration(
-                    labelText: 'Value (for primitives)',
-                  ),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text('Cancel'),
-              ),
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('Add'),
-              ),
-            ],
-          ),
-    );
-    if (res != true) return;
-    final k = keyCtrl.text.trim();
-    if (k.isEmpty) return _showError('Key required');
-    final t = typeCtrl.value;
-    dynamic val;
-    if (t == 'int')
-      val = int.tryParse(valueCtrl.text) ?? 0;
-    else if (t == 'double')
-      val = double.tryParse(valueCtrl.text) ?? 0.0;
-    else if (t == 'bool')
-      val = (valueCtrl.text.toLowerCase() == 'true');
-    else if (t == 'map')
-      val = <String, dynamic>{};
-    else if (t == 'list')
-      val = <dynamic>[];
-    else
-      val = valueCtrl.text;
-    final nav = JsonNavigator(_root);
-    final map = nav.getNode(mapPath);
-    if (map is Map<String, dynamic>) {
-      if (map.containsKey(k)) return _showError('Key exists');
-      _pushHistory();
-      map[k] = val;
-      setState(() {
-        _setRawEditorFromEditorPath();
-        _valueControllers.removeWhere((p, c) => p.startsWith(mapPath));
-      });
-    } else {
-      _showError('Target not map');
+  // ---------- node menus handlers ----------
+  void _handleMapNodeMenu(Map node, String mapPath, String action) {
+    // map-level actions: duplicate entire map node, move up/down map within parent, delete
+    switch (action) {
+      case 'duplicate':
+        _pushSnapshot();
+        JsonNavigator(_root).duplicateNode(mapPath);
+        setState(() => _syncInspectorToEditorPath());
+        break;
+      case 'moveUp':
+        // find parent and index of this map key
+        final parentPath = _parentPath(mapPath);
+        if (parentPath == null || parentPath.isEmpty) break;
+        final parent = JsonNavigator(_root).getNode(parentPath);
+        if (parent is Map<String, dynamic>) {
+          final key = mapPath.substring(mapPath.lastIndexOf('/') + 1);
+          final idx = parent.keys.toList().indexOf(key);
+          if (idx > 0) {
+            _pushSnapshot();
+            JsonNavigator(_root).moveMapKey(parentPath, idx, idx - 1);
+            setState(() => _syncInspectorToEditorPath());
+          }
+        } else if (parent is List) {
+          final idx = int.tryParse(mapPath.split('/').last) ?? -1;
+          if (idx > 0) {
+            _pushSnapshot();
+            final list = parent;
+            final tmp = list[idx - 1];
+            list[idx - 1] = list[idx];
+            list[idx] = tmp;
+            setState(() => _syncInspectorToEditorPath());
+          }
+        }
+        break;
+      case 'moveDown':
+        final parentPath = _parentPath(mapPath);
+        if (parentPath == null || parentPath.isEmpty) break;
+        final parent = JsonNavigator(_root).getNode(parentPath);
+        if (parent is Map<String, dynamic>) {
+          final key = mapPath.substring(mapPath.lastIndexOf('/') + 1);
+          final keys = parent.keys.toList();
+          final idx = keys.indexOf(key);
+          if (idx >= 0 && idx < keys.length - 1) {
+            _pushSnapshot();
+            JsonNavigator(_root).moveMapKey(parentPath, idx, idx + 1);
+            setState(() => _syncInspectorToEditorPath());
+          }
+        } else if (parent is List) {
+          final idx = int.tryParse(mapPath.split('/').last) ?? -1;
+          final list = parent;
+          if (idx >= 0 && idx < list.length - 1) {
+            _pushSnapshot();
+            final tmp = list[idx + 1];
+            list[idx + 1] = list[idx];
+            list[idx] = tmp;
+            setState(() => _syncInspectorToEditorPath());
+          }
+        }
+        break;
+      case 'delete':
+        _deleteNodeConfirm(mapPath);
+        break;
     }
   }
 
-  Future<void> _addListItemDialog(String listPath) async {
-    final typeCtrl = ValueNotifier<String>('string');
-    final valueCtrl = TextEditingController();
-    final res = await showDialog<bool?>(
-      context: context,
-      builder:
-          (ctx) => AlertDialog(
-            title: const Text('Add list item'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                ValueListenableBuilder<String>(
-                  valueListenable: typeCtrl,
-                  builder:
-                      (_, v, __) => DropdownButtonFormField<String>(
-                        value: v,
-                        items: const [
-                          DropdownMenuItem(
-                            value: 'string',
-                            child: Text('String'),
-                          ),
-                          DropdownMenuItem(value: 'int', child: Text('Int')),
-                          DropdownMenuItem(
-                            value: 'double',
-                            child: Text('Double'),
-                          ),
-                          DropdownMenuItem(value: 'bool', child: Text('Bool')),
-                          DropdownMenuItem(value: 'map', child: Text('Map')),
-                          DropdownMenuItem(value: 'list', child: Text('List')),
-                        ],
-                        onChanged: (vv) => typeCtrl.value = vv ?? 'string',
-                      ),
-                ),
-                TextField(
-                  controller: valueCtrl,
-                  decoration: const InputDecoration(
-                    labelText: 'Value (for primitives)',
-                  ),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text('Cancel'),
-              ),
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('Add'),
-              ),
-            ],
-          ),
-    );
-    if (res != true) return;
-    final t = typeCtrl.value;
-    dynamic val;
-    if (t == 'int')
-      val = int.tryParse(valueCtrl.text) ?? 0;
-    else if (t == 'double')
-      val = double.tryParse(valueCtrl.text) ?? 0.0;
-    else if (t == 'bool')
-      val = (valueCtrl.text.toLowerCase() == 'true');
-    else if (t == 'map')
-      val = <String, dynamic>{};
-    else if (t == 'list')
-      val = <dynamic>[];
-    else
-      val = valueCtrl.text;
-    final nav = JsonNavigator(_root);
-    final ok = nav.insertIntoList(listPath, val);
-    if (!ok)
-      _showError('Target is not a list');
-    else {
-      _pushHistory();
-      setState(() {
-        _setRawEditorFromEditorPath();
-        _valueControllers.removeWhere((p, c) => p.startsWith(listPath));
-      });
-    }
-  }
-
-  void _moveListItemUp(String listPath, int idx) {
-    final nav = JsonNavigator(_root);
-    final list = nav.getNode(listPath);
-    if (list is List && idx > 0) {
-      _pushHistory();
-      final tmp = list[idx - 1];
-      list[idx - 1] = list[idx];
-      list[idx] = tmp;
-      setState(() {
-        _setRawEditorFromEditorPath();
-        _valueControllers.removeWhere((p, c) => p.startsWith(listPath));
-      });
-    }
-  }
-
-  void _moveListItemDown(String listPath, int idx) {
-    final nav = JsonNavigator(_root);
-    final list = nav.getNode(listPath);
-    if (list is List && idx < list.length - 1) {
-      _pushHistory();
-      final tmp = list[idx + 1];
-      list[idx + 1] = list[idx];
-      list[idx] = tmp;
-      setState(() {
-        _setRawEditorFromEditorPath();
-        _valueControllers.removeWhere((p, c) => p.startsWith(listPath));
-      });
-    }
-  }
-
-  // ---------- delete/rename/duplicate handlers for map & list ----------
-  Future<void> _handleNodeMenuMap(
+  void _handleMapChildMenu(
     Map parentMap,
     String key,
-    int index,
-    String path,
+    int idx,
+    String childPath,
     String action,
   ) async {
     switch (action) {
       case 'open':
-        setState(() => _editorPath = path);
-        _setRawEditorFromEditorPath();
+        setState(() => _editorPath = childPath);
         break;
       case 'duplicate':
-        _pushHistory();
-        // duplicate directly below
-        final nav = JsonNavigator(_root);
-        final mapPath = _parentPath(path) ?? '';
-        nav.duplicateNode(path);
-        setState(() {
-          _setRawEditorFromEditorPath();
+        _pushSnapshot();
+        final val = parentMap[key];
+        // insert copy directly after this key (rebuild order)
+        var newKey = '${key}_copy';
+        var i = 1;
+        while (parentMap.containsKey(newKey)) {
+          newKey = '${key}_copy$i';
+          i++;
+        }
+        final newMap = <String, dynamic>{};
+        parentMap.forEach((k, v) {
+          newMap[k] = v;
+          if (k == key) newMap[newKey] = jsonDecode(jsonEncode(val));
         });
+        parentMap
+          ..clear()
+          ..addAll(newMap);
+        setState(() => _syncInspectorToEditorPath());
         break;
       case 'moveUp':
-        _pushHistory();
-        final mapPath = _parentPath(path) ?? '';
-        final nav2 = JsonNavigator(_root);
-        if (nav2.moveMapEntryUp(mapPath, key)) {
-          setState(() {
-            _setRawEditorFromEditorPath();
-          });
+        // move key up within parentMap
+        final keys = parentMap.keys.toList();
+        final pos = keys.indexOf(key);
+        if (pos > 0) {
+          _pushSnapshot();
+          JsonNavigator(
+            _root,
+          ).moveMapKey(_parentPathForKey(parentMap) ?? '', pos, pos - 1);
+          setState(() => _syncInspectorToEditorPath());
         }
         break;
       case 'moveDown':
-        _pushHistory();
-        final mapPath2 = _parentPath(path) ?? '';
-        final nav3 = JsonNavigator(_root);
-        if (nav3.moveMapEntryDown(mapPath2, key)) {
-          setState(() {
-            _setRawEditorFromEditorPath();
-          });
+        final keys = parentMap.keys.toList();
+        final pos = keys.indexOf(key);
+        if (pos >= 0 && pos < keys.length - 1) {
+          _pushSnapshot();
+          JsonNavigator(
+            _root,
+          ).moveMapKey(_parentPathForKey(parentMap) ?? '', pos, pos + 1);
+          setState(() => _syncInspectorToEditorPath());
         }
         break;
       case 'rename':
-        final ctrl = TextEditingController(text: key);
-        final res = await showDialog<bool?>(
-          context: context,
-          builder:
-              (ctx) => AlertDialog(
-                title: const Text('Rename key'),
-                content: TextField(controller: ctrl),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(ctx, false),
-                    child: const Text('Cancel'),
-                  ),
-                  TextButton(
-                    onPressed: () => Navigator.pop(ctx, true),
-                    child: const Text('Rename'),
-                  ),
-                ],
-              ),
-        );
-        if (res == true) {
-          final newKey = ctrl.text.trim();
-          if (newKey.isEmpty) return _showError('Key required');
-          final nav4 = JsonNavigator(_root);
-          final parentPath = _parentPath(path) ?? '';
-          final ok = nav4.renameNode(
-            parentPath,
-            newKey,
-          ); // rename inside parent map
-          // but renameNode takes full path - construct full path:
-          // Actually implement rename via map modification directly:
-          final parent = nav4.getNode(parentPath);
-          if (parent is Map<String, dynamic>) {
-            if (parent.containsKey(newKey)) return _showError('Key exists');
-            final val = parent.remove(key);
-            _pushHistory();
-            parent[newKey] = val;
-            setState(() {
-              _setRawEditorFromEditorPath();
-            });
-          } else {
-            _showError('Rename failed');
-          }
+        final newK = await _promptRenameKey(key);
+        if (newK != null && newK.isNotEmpty && newK != key) {
+          if (parentMap.containsKey(newK)) return _showSnack('Key exists');
+          _pushSnapshot();
+          final val = parentMap.remove(key);
+          parentMap[newK] = val;
+          setState(() => _syncInspectorToEditorPath());
         }
         break;
       case 'delete':
@@ -1467,7 +1255,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           builder:
               (ctx) => AlertDialog(
                 title: const Text('Delete'),
-                content: Text('Delete $key?'),
+                content: Text('Delete "$key"?'),
                 actions: [
                   TextButton(
                     onPressed: () => Navigator.pop(ctx, false),
@@ -1481,55 +1269,73 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               ),
         );
         if (ok == true) {
-          _pushHistory();
+          _pushSnapshot();
           parentMap.remove(key);
-          setState(() {
-            _setRawEditorFromEditorPath();
-          });
+          setState(() => _syncInspectorToEditorPath());
         }
         break;
     }
   }
 
-  Future<void> _handleNodeMenuList(
+  void _handleListNodeMenu(
     List parentList,
     int idx,
     String path,
     String action,
   ) async {
     switch (action) {
+      case 'duplicate':
+        _pushSnapshot();
+        if (idx == -1) {
+          // duplicate entire list node
+          JsonNavigator(_root).duplicateNode(path);
+        } else {
+          final val = parentList[idx];
+          parentList.insert(idx + 1, jsonDecode(jsonEncode(val)));
+        }
+        setState(() => _syncInspectorToEditorPath());
+        break;
+      case 'delete':
+        if (idx == -1) {
+          // delete entire list node
+          _deleteNodeConfirm(path);
+        }
+        break;
+    }
+  }
+
+  void _handleListChildMenu(
+    List parentList,
+    int idx,
+    String childPath,
+    String action,
+  ) async {
+    switch (action) {
       case 'open':
-        setState(() => _editorPath = path);
-        _setRawEditorFromEditorPath();
+        setState(() => _editorPath = childPath);
         break;
       case 'duplicate':
-        _pushHistory();
+        _pushSnapshot();
         final val = parentList[idx];
         parentList.insert(idx + 1, jsonDecode(jsonEncode(val)));
-        setState(() {
-          _setRawEditorFromEditorPath();
-        });
+        setState(() => _syncInspectorToEditorPath());
         break;
       case 'moveUp':
         if (idx > 0) {
-          _pushHistory();
+          _pushSnapshot();
           final tmp = parentList[idx - 1];
           parentList[idx - 1] = parentList[idx];
           parentList[idx] = tmp;
-          setState(() {
-            _setRawEditorFromEditorPath();
-          });
+          setState(() => _syncInspectorToEditorPath());
         }
         break;
       case 'moveDown':
         if (idx < parentList.length - 1) {
-          _pushHistory();
+          _pushSnapshot();
           final tmp = parentList[idx + 1];
           parentList[idx + 1] = parentList[idx];
           parentList[idx] = tmp;
-          setState(() {
-            _setRawEditorFromEditorPath();
-          });
+          setState(() => _syncInspectorToEditorPath());
         }
         break;
       case 'delete':
@@ -1552,49 +1358,208 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               ),
         );
         if (ok == true) {
-          _pushHistory();
+          _pushSnapshot();
           parentList.removeAt(idx);
-          setState(() {
-            _setRawEditorFromEditorPath();
-          });
+          setState(() => _syncInspectorToEditorPath());
         }
         break;
     }
   }
 
-  void _handleMapHeaderAction(String path, String action) {
-    final nav = JsonNavigator(_root);
-    if (action == 'duplicate') {
-      _pushHistory();
-      nav.duplicateNode(path);
-      setState(() {
-        _setRawEditorFromEditorPath();
-      });
-      return;
+  // helper: find parent path for a given map reference - not perfect, best effort
+  String? _parentPathForKey(Map mapRef) {
+    // traverse tree to find parent path where identical map instance is located
+    String? found;
+    void walk(dynamic node, String path) {
+      if (found != null) return;
+      if (identical(node, mapRef)) {
+        found = path;
+        return;
+      }
+      if (node is Map<String, dynamic>) {
+        node.forEach((k, v) {
+          walk(v, path.isEmpty ? k : '$path/$k');
+        });
+      } else if (node is List) {
+        for (int i = 0; i < node.length; i++) {
+          walk(node[i], path.isEmpty ? '$i' : '$path/$i');
+        }
+      }
     }
-    if (action == 'delete') {
-      _deleteNodeConfirm(path);
-      return;
+
+    walk(_root, '');
+    return found;
+  }
+
+  Future<String?> _promptRenameKey(String oldKey) {
+    final ctrl = TextEditingController(text: oldKey);
+    return showDialog<String?>(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Rename key'),
+            content: TextField(controller: ctrl),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+                child: const Text('Rename'),
+              ),
+            ],
+          ),
+    );
+  }
+
+  // ---------- add dialogs ----------
+  Future<void> _addMapKeyDialog(String mapPath) async {
+    final keyCtrl = TextEditingController();
+    var type = 'string';
+    final valueCtrl = TextEditingController();
+    final ok = await showDialog<bool?>(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Add key'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: keyCtrl,
+                  decoration: const InputDecoration(labelText: 'Key'),
+                ),
+                DropdownButtonFormField<String>(
+                  value: 'string',
+                  items: const [
+                    DropdownMenuItem(value: 'string', child: Text('String')),
+                    DropdownMenuItem(value: 'int', child: Text('Int')),
+                    DropdownMenuItem(value: 'double', child: Text('Double')),
+                    DropdownMenuItem(value: 'bool', child: Text('Bool')),
+                    DropdownMenuItem(value: 'map', child: Text('Map')),
+                    DropdownMenuItem(value: 'list', child: Text('List')),
+                  ],
+                  onChanged: (v) => type = v ?? 'string',
+                ),
+                TextField(
+                  controller: valueCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Value (primitives only)',
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Add'),
+              ),
+            ],
+          ),
+    );
+    if (ok != true) return;
+    final key = keyCtrl.text.trim();
+    if (key.isEmpty) return _showSnack('Key required');
+    dynamic val;
+    if (type == 'int')
+      val = int.tryParse(valueCtrl.text) ?? 0;
+    else if (type == 'double')
+      val = double.tryParse(valueCtrl.text) ?? 0.0;
+    else if (type == 'bool')
+      val = (valueCtrl.text.toLowerCase() == 'true');
+    else if (type == 'map')
+      val = <String, dynamic>{};
+    else if (type == 'list')
+      val = <dynamic>[];
+    else
+      val = valueCtrl.text;
+    final nav = JsonNavigator(_root);
+    final map = nav.getNode(mapPath);
+    if (map is Map<String, dynamic>) {
+      if (map.containsKey(key)) return _showSnack('Key exists');
+      _pushSnapshot();
+      // insert at end (or we could attempt to place near selection)
+      map[key] = val;
+      setState(() => _syncInspectorToEditorPath());
+    } else {
+      _showSnack('Target not a map');
     }
   }
 
-  void _handleListHeaderAction(String path, String action) {
+  Future<void> _addListItemDialog(String listPath) async {
+    var type = 'string';
+    final valueCtrl = TextEditingController();
+    final ok = await showDialog<bool?>(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Add list item'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                DropdownButtonFormField<String>(
+                  value: 'string',
+                  items: const [
+                    DropdownMenuItem(value: 'string', child: Text('String')),
+                    DropdownMenuItem(value: 'int', child: Text('Int')),
+                    DropdownMenuItem(value: 'double', child: Text('Double')),
+                    DropdownMenuItem(value: 'bool', child: Text('Bool')),
+                    DropdownMenuItem(value: 'map', child: Text('Map')),
+                    DropdownMenuItem(value: 'list', child: Text('List')),
+                  ],
+                  onChanged: (v) => type = v ?? 'string',
+                ),
+                TextField(
+                  controller: valueCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Value (primitives only)',
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Add'),
+              ),
+            ],
+          ),
+    );
+    if (ok != true) return;
+    dynamic val;
+    if (type == 'int')
+      val = int.tryParse(valueCtrl.text) ?? 0;
+    else if (type == 'double')
+      val = double.tryParse(valueCtrl.text) ?? 0.0;
+    else if (type == 'bool')
+      val = (valueCtrl.text.toLowerCase() == 'true');
+    else if (type == 'map')
+      val = <String, dynamic>{};
+    else if (type == 'list')
+      val = <dynamic>[];
+    else
+      val = valueCtrl.text;
     final nav = JsonNavigator(_root);
-    if (action == 'duplicate') {
-      _pushHistory();
-      nav.duplicateNode(path);
-      setState(() {
-        _setRawEditorFromEditorPath();
-      });
-      return;
-    }
-    if (action == 'delete') {
-      _deleteNodeConfirm(path);
-      return;
+    final ok2 = nav.insertIntoList(listPath, val);
+    if (!ok2)
+      _showSnack('Target not a list');
+    else {
+      _pushSnapshot();
+      setState(() => _syncInspectorToEditorPath());
     }
   }
 
-  Future<void> _deleteNodeConfirm(String path) async {
+  // ---------- delete/rename/duplicate helpers ----------
+  void _deleteNodeConfirm(String path) async {
     final ok = await showDialog<bool?>(
       context: context,
       builder:
@@ -1616,172 +1581,91 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     if (ok != true) return;
     final nav = JsonNavigator(_root);
     final success = nav.deleteNode(path);
-    if (!success) return _showError('Delete failed');
-    final p = _parentPath(path) ?? '';
-    _pushHistory();
+    if (!success) return _showSnack('Delete failed');
+    _pushSnapshot();
     setState(() {
+      final p = _parentPath(path) ?? '';
       _selectedPath = p.isEmpty ? null : p;
-      _selectedValue = p.isEmpty ? null : nav.getNode(p);
       _editorPath = _selectedPath;
-      _setRawEditorFromEditorPath();
-      _valueControllers.removeWhere(
-        (k, v) => k.startsWith(path) || k.startsWith(p),
-      );
+      _syncInspectorToEditorPath();
     });
   }
 
-  Future<void> _renameMapKeyDialog(String mapPath, String key) async {
-    final ctrl = TextEditingController(text: key);
-    final ok = await showDialog<bool?>(
+  Future<void> _promptRenameNode(String path) async {
+    final parts = path.split('/');
+    final old = parts.isNotEmpty ? parts.last : '';
+    final ctrl = TextEditingController(text: old);
+    final newName = await showDialog<String?>(
       context: context,
       builder:
           (ctx) => AlertDialog(
-            title: const Text('Rename key'),
+            title: const Text('Rename'),
             content: TextField(controller: ctrl),
             actions: [
               TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
+                onPressed: () => Navigator.pop(ctx),
                 child: const Text('Cancel'),
               ),
               TextButton(
-                onPressed: () => Navigator.pop(ctx, true),
+                onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
                 child: const Text('Rename'),
               ),
             ],
           ),
     );
-    if (ok != true) return;
-    final newKey = ctrl.text.trim();
-    if (newKey.isEmpty) return _showError('Key required');
+    if (newName == null || newName.isEmpty || newName == old) return;
     final nav = JsonNavigator(_root);
-    final map = nav.getNode(mapPath);
-    if (map is Map<String, dynamic>) {
-      final val = map.remove(key);
-      _pushHistory();
-      map[newKey] = val;
+    final ok = nav.renameNode(path, newName);
+    if (!ok) return _showSnack('Rename failed or key exists');
+    _pushSnapshot();
+    setState(() => _syncInspectorToEditorPath());
+  }
+
+  // ---------- inspector sync & editor apply/reset ----------
+  void _syncInspectorToEditorPath() {
+    final nav = JsonNavigator(_root);
+    final node = _editorPath == null ? _root : nav.getNode(_editorPath!);
+    final txt =
+        node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
+    // Per your requirement: inspector JSON must always sync with visual editor.
+    // That means we update the inspector text programmatically whenever model changes.
+    // This will overwrite unsaved edits in the inspector. This follows your instruction.
+    _setInspectorTextProgrammatic(txt);
+  }
+
+  void _applyRawEditor() {
+    // Manual apply only when user clicks Apply
+    if (_editorPath == null) return;
+    try {
+      final parsed = jsonDecode(_rawEditorController.text);
+      final nav = JsonNavigator(_root);
+      _pushSnapshot();
+      final ok = nav.setNode(_editorPath!, parsed);
+      if (!ok) throw Exception('Set failed');
       setState(() {
-        _setRawEditorFromEditorPath();
+        _rawEditorDirty = false;
+        _syncInspectorToEditorPath();
+        _showSnack('Applied JSON to model');
       });
+    } catch (e) {
+      _showSnack('Invalid JSON: $e');
     }
   }
 
+  void _resetInspectorToEditorPath() {
+    _syncInspectorToEditorPath();
+    _rawEditorDirty = false;
+    _showSnack('Inspector reset to model');
+  }
+
+  // helper: parent path substring
   String? _parentPath(String path) {
     if (!path.contains('/')) return '';
     final idx = path.lastIndexOf('/');
     return path.substring(0, idx);
   }
 
-  // ---------- raw editor apply/save ----------
-  Future<void> _saveRawEditorIfDirty() async {
-    if (!_rawEditorDirty) return;
-    if (_editorPath == null) return;
-    final text = _rawEditorController.text;
-    try {
-      final parsed = jsonDecode(text);
-      final nav = JsonNavigator(_root);
-      _pushHistory();
-      final ok = nav.setNode(_editorPath!, parsed);
-      if (!ok) throw Exception('Apply failed');
-      setState(() {
-        // after applying, update raw editor to canonical formatting
-        final current = nav.getNode(_editorPath!);
-        final newText = const JsonEncoder.withIndent('  ').convert(current);
-        _setRawEditorTextProgrammatic(newText);
-        _jsonEditHistory.clear();
-        _jsonEditHistory.add(newText);
-        _jsonEditIndex = 0;
-        _rawEditorDirty = false;
-      });
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Saved JSON to model')));
-    } catch (e) {
-      _showError('Invalid JSON: $e');
-    }
-  }
-
-  void _applyRawEditor() {
-    // Only apply when button is pressed
-    _saveRawEditorIfDirty();
-  }
-
-  void _setRawEditorTextProgrammatic(String txt) {
-    final hadFocus = _rawEditorFocusNode.hasFocus;
-    _rawEditorFocusNode.canRequestFocus = false;
-    _rawEditorController.text = txt;
-    _rawEditorDirty = false;
-    _rawEditorFocusNode.canRequestFocus = true;
-    if (hadFocus) _rawEditorFocusNode.requestFocus();
-  }
-
-  void _setRawEditorFromEditorPath() {
-    final nav = JsonNavigator(_root);
-    final node = _editorPath == null ? _root : nav.getNode(_editorPath!);
-    final display =
-        node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
-    // Always set the raw editor to model state (no guard). This ensures perfect sync.
-    _setRawEditorTextProgrammatic(display);
-    // also reset local json edit history to the current model
-    _jsonEditHistory.clear();
-    _jsonEditHistory.add(display);
-    _jsonEditIndex = 0;
-  }
-
-  // ---------- syntax highlighter for inspector view (readonly) ----------
-  TextSpan _highlightJson(String src) {
-    final children = <TextSpan>[];
-    final reg = RegExp(
-      r'(\"(\\\\.|[^\\\\\"])*\")|\b(-?\d+\.?\d*(?:[eE][+-]?\d+)?)\b|\b(true|false|null)\b|[{}\[\],:]',
-      multiLine: true,
-    );
-    int last = 0;
-    for (final m in reg.allMatches(src)) {
-      if (m.start > last)
-        children.add(
-          TextSpan(
-            text: src.substring(last, m.start),
-            style: const TextStyle(color: Colors.black),
-          ),
-        );
-      final tok = m.group(0)!;
-      if (tok.startsWith('"'))
-        children.add(
-          TextSpan(text: tok, style: const TextStyle(color: Color(0xFF6A8759))),
-        );
-      else if (tok == 'true' || tok == 'false' || tok == 'null')
-        children.add(
-          TextSpan(text: tok, style: const TextStyle(color: Color(0xFF9876AA))),
-        );
-      else if (RegExp(r'^-?\d').hasMatch(tok))
-        children.add(
-          TextSpan(text: tok, style: const TextStyle(color: Color(0xFF6897BB))),
-        );
-      else
-        children.add(
-          TextSpan(
-            text: tok,
-            style: const TextStyle(
-              color: Color(0xFFCC7832),
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        );
-      last = m.end;
-    }
-    if (last < src.length)
-      children.add(
-        TextSpan(
-          text: src.substring(last),
-          style: const TextStyle(color: Colors.black),
-        ),
-      );
-    return TextSpan(
-      style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
-      children: children,
-    );
-  }
-
-  // ---------- UI build ----------
+  // ---------- UI building ----------
   Widget _buildSidebar() {
     return Container(
       key: _sidebarRootKey,
@@ -1799,43 +1683,10 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
                 ),
                 Row(
                   children: [
-                    Tooltip(
-                      message: 'Undo last change',
-                      child: IconButton(
-                        onPressed: _undo,
-                        icon: const Icon(Icons.undo),
-                      ),
-                    ),
-                    Tooltip(
-                      message: 'Redo',
-                      child: IconButton(
-                        onPressed: _redo,
-                        icon: const Icon(Icons.redo),
-                      ),
-                    ),
-                    Tooltip(
-                      message: 'Clear document',
-                      child: TextButton(
-                        onPressed: () {
-                          setState(() {
-                            _root = {};
-                            _selectedPath = null;
-                            _selectedValue = null;
-                            _editorPath = null;
-                            _rawEditorController.clear();
-                            _valueControllers.clear();
-                            _tileKeys.clear();
-                            _titleKeys.clear();
-                            _jsonEditHistory.clear();
-                            _jsonEditIndex = -1;
-                            _rawEditorDirty = false;
-                            _undoStack.clear();
-                            _redoStack.clear();
-                          });
-                        },
-                        child: const Text('Clear'),
-                      ),
-                    ),
+                    Tooltip(message: 'Undo'),
+                    IconButton(onPressed: _undo, icon: const Icon(Icons.undo)),
+                    Tooltip(message: 'Redo'),
+                    IconButton(onPressed: _redo, icon: const Icon(Icons.redo)),
                   ],
                 ),
               ],
@@ -1845,11 +1696,7 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
           Expanded(
             child:
                 _root.isEmpty
-                    ? const Center(
-                      child: Text(
-                        'No document loaded. Use Paste or Load Sample',
-                      ),
-                    )
+                    ? const Center(child: Text('No document loaded'))
                     : SingleChildScrollView(
                       controller: _sidebarScroll,
                       child: Padding(
@@ -1863,104 +1710,133 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
   }
 
-  Widget _buildCenterEditor() {
-    return Container(
-      color: Colors.white,
-      child: Column(
-        children: [
-          Container(
-            height: 52,
-            color: Colors.grey.shade50,
-            child: Row(
-              children: [
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: Text('Selected: ${_selectedPath ?? "<none>"}'),
-                  ),
-                ),
-                Tooltip(
-                  message: 'Validate document',
-                  child: TextButton(
-                    onPressed: _validateDocument,
-                    child: const Text('Validate'),
-                  ),
-                ),
-              ],
-            ),
+  TextSpan _syntaxHighlightJson(String src) {
+    // lightweight JSON highlighter for SelectableText.rich
+    final List<TextSpan> spans = [];
+    final reg = RegExp(
+      r'(\"(\\.|[^"\\])*")|(\b(true|false|null)\b)|(-?\d+(\.\d+)?([eE][+-]?\d+)?)|[{}\[\],:]',
+    );
+    int last = 0;
+    for (final m in reg.allMatches(src)) {
+      if (m.start > last)
+        spans.add(
+          TextSpan(
+            text: src.substring(last, m.start),
+            style: const TextStyle(color: Colors.black),
           ),
-          Expanded(
-            child:
-                _editorPath == null
-                    ? const Center(child: Text('Select a node to edit'))
-                    : Padding(
-                      padding: const EdgeInsets.all(8),
-                      child: Column(
-                        children: [
-                          Expanded(child: _buildVisualInspector()),
-                          const SizedBox(height: 8),
-                          Row(
-                            children: [
-                              Tooltip(
-                                message: 'Apply JSON from editor',
-                                child: ElevatedButton(
-                                  onPressed: _applyRawEditor,
-                                  child: const Text('Apply'),
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Tooltip(
-                                message: 'Reset JSON editor to model',
-                                child: ElevatedButton(
-                                  onPressed: () {
-                                    _setRawEditorFromEditorPath();
-                                    _jsonEditHistory.clear();
-                                    _jsonEditHistory.add(
-                                      _rawEditorController.text,
-                                    );
-                                    _jsonEditIndex = 0;
-                                    _rawEditorDirty = false;
-                                  },
-                                  child: const Text('Reset'),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-          ),
-        ],
-      ),
+        );
+      final tok = m.group(0)!;
+      TextStyle style;
+      if (tok.startsWith('"'))
+        style = const TextStyle(color: Color(0xFF6A8759)); // string
+      else if (tok == 'true' || tok == 'false' || tok == 'null')
+        style = const TextStyle(color: Color(0xFF9876AA)); // keyword
+      else if (RegExp(r'^-?\d').hasMatch(tok))
+        style = const TextStyle(color: Color(0xFF6897BB)); // number
+      else
+        style = const TextStyle(
+          color: Color(0xFFCC7832),
+          fontWeight: FontWeight.bold,
+        ); // braces/punct
+      spans.add(TextSpan(text: tok, style: style));
+      last = m.end;
+    }
+    if (last < src.length)
+      spans.add(
+        TextSpan(
+          text: src.substring(last),
+          style: const TextStyle(color: Colors.black),
+        ),
+      );
+    return TextSpan(
+      style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+      children: spans,
     );
   }
 
-  void _validateDocument() {
-    try {
-      jsonDecode(_rawEditorController.text);
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Valid JSON')));
-    } catch (e) {
-      _showError('Invalid JSON: $e');
-    }
-  }
-
   Widget _buildInspector() {
+    debugPrint('Rebuilding inspector for path: $_editorPath');
     final nav = JsonNavigator(_root);
-    final node = _editorPath == null ? _root : nav.getNode(_editorPath);
+    final node = _editorPath == null ? _root : nav.getNode(_editorPath!);
     final display =
         node == null ? '{}' : const JsonEncoder.withIndent('  ').convert(node);
+    // inspectorHeader with toggle and actions
     return Container(
       color: Colors.grey.shade50,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Padding(
-            padding: EdgeInsets.all(12.0),
-            child: Text(
-              'Inspector',
-              style: TextStyle(fontWeight: FontWeight.bold),
+          Padding(
+            padding: const EdgeInsets.all(12.0),
+            child: Row(
+              children: [
+                const Text(
+                  'Inspector',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const Spacer(),
+                Tooltip(
+                  message:
+                      _inspectorEditable
+                          ? 'Switch to read-only'
+                          : 'Switch to editable',
+                  child: IconButton(
+                    icon: Icon(
+                      _inspectorEditable ? Icons.lock_open : Icons.lock,
+                    ),
+                    onPressed: () {
+                      setState(() {
+                        _inspectorEditable = !_inspectorEditable;
+                        // when switching to editable, ensure the text is up-to-date
+                        _setInspectorTextProgrammatic(
+                          const JsonEncoder.withIndent(
+                            '  ',
+                          ).convert(node ?? {}),
+                        );
+                      });
+                    },
+                  ),
+                ),
+
+                PopupMenuButton<String>(
+                  tooltip: 'More',
+                  icon: const Icon(Icons.more_vert),
+                  onSelected: (v) {
+                    switch (v) {
+                      case 'duplicate':
+                        if (_editorPath != null) {
+                          _pushSnapshot();
+                          JsonNavigator(_root).duplicateNode(_editorPath!);
+                          setState(() => _syncInspectorToEditorPath());
+                        }
+                        break;
+                      case 'rename':
+                        if (_editorPath != null)
+                          _promptRenameNode(_editorPath!);
+                        break;
+                      case 'delete':
+                        if (_editorPath != null)
+                          _deleteNodeConfirm(_editorPath!);
+                        break;
+                    }
+                  },
+                  itemBuilder:
+                      (ctx) => const [
+                        PopupMenuItem(
+                          value: 'duplicate',
+                          child: Text('Duplicate'),
+                        ),
+                        PopupMenuItem(value: 'rename', child: Text('Rename')),
+                        PopupMenuItem(
+                          value: 'delete',
+                          child: Text(
+                            'Delete',
+                            style: TextStyle(color: Colors.red),
+                          ),
+                        ),
+                      ],
+                ),
+              ],
             ),
           ),
           const Divider(height: 1),
@@ -1969,143 +1845,62 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
               padding: const EdgeInsets.all(12.0),
               child: Column(
                 children: [
-                  TabBar(
-                    controller: _inspectorTabController,
-                    tabs: const [Tab(text: 'View'), Tab(text: 'JSON')],
-                    labelColor: Colors.black,
-                  ),
-                  const SizedBox(height: 8),
+                  // JSON view or editable field (single view toggled)
                   Expanded(
-                    child: TabBarView(
-                      controller: _inspectorTabController,
-                      children: [
-                        // View: readonly pretty syntax highlighted
-                        Scrollbar(
-                          controller: _inspectorVController,
+                    child: Scrollbar(
+                      controller: _inspectorV,
+                      thumbVisibility: true,
+                      child: SingleChildScrollView(
+                        controller: _inspectorV,
+                        child: Scrollbar(
+                          controller: _inspectorH,
                           thumbVisibility: true,
                           child: SingleChildScrollView(
-                            controller: _inspectorVController,
-                            child: Scrollbar(
-                              controller: _inspectorHController,
-                              thumbVisibility: true,
-                              child: SingleChildScrollView(
-                                controller: _inspectorHController,
-                                scrollDirection: Axis.horizontal,
-                                child: SelectableText.rich(
-                                  _highlightJson(display),
-                                ),
-                              ),
+                            controller: _inspectorH,
+                            scrollDirection: Axis.horizontal,
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(minWidth: 600),
+                              child:
+                                  _inspectorEditable
+                                      ? SizedBox(
+                                        height:
+                                            MediaQuery.of(context).size.height -
+                                            200,
+                                        width: 1000,
+                                        child: JsonEditorView(
+                                          key:  Key(display),
+                                          initialJson: display,
+                                          onChanged: (updated) {
+                                            _rawEditorController.text = updated;
+                                            _rawEditorDirty = true;
+                                          },
+                                        ),
+                                      )
+                                      : SelectableText.rich(
+                                        _syntaxHighlightJson(display),
+                                      ),
                             ),
                           ),
                         ),
-                        // JSON Editor
-                        Column(
-                          children: [
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.end,
-                              children: [
-                                Tooltip(message: 'JSON undo'),
-                                IconButton(
-                                  onPressed: _jsonUndo,
-                                  icon: const Icon(Icons.undo),
-                                ),
-                                Tooltip(message: 'JSON redo'),
-                                IconButton(
-                                  onPressed: _jsonRedo,
-                                  icon: const Icon(Icons.redo),
-                                ),
-                                Tooltip(message: 'Save JSON to model'),
-                                IconButton(
-                                  onPressed: _saveRawEditorIfDirty,
-                                  icon: const Icon(Icons.save),
-                                ),
-                                PopupMenuButton<String>(
-                                  tooltip: 'More actions',
-                                  icon: const Icon(Icons.more_vert),
-                                  onSelected: (v) {
-                                    if (v == 'duplicate')
-                                      _handleDuplicateNode();
-                                    else if (v == 'rename')
-                                      _handleRenameNode();
-                                    else if (v == 'delete')
-                                      _handleDeleteNode();
-                                  },
-                                  itemBuilder:
-                                      (ctx) => const [
-                                        PopupMenuItem(
-                                          value: 'duplicate',
-                                          child: Text('Duplicate'),
-                                        ),
-                                        PopupMenuItem(
-                                          value: 'rename',
-                                          child: Text('Rename'),
-                                        ),
-                                        PopupMenuItem(
-                                          value: 'delete',
-                                          child: Text(
-                                            'Delete',
-                                            style: TextStyle(color: Colors.red),
-                                          ),
-                                        ),
-                                      ],
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 8),
-                            Expanded(
-                              child: Focus(
-                                onFocusChange: (hasFocus) {
-                                  if (!hasFocus) {
-                                    /* do nothing, apply only when requested */
-                                  }
-                                },
-                                child: TextField(
-                                  controller: _rawEditorController,
-                                  focusNode: _rawEditorFocusNode,
-                                  maxLines: null,
-                                  decoration: const InputDecoration(
-                                    border: OutlineInputBorder(),
-                                  ),
-                                  style: const TextStyle(
-                                    fontFamily: 'monospace',
-                                  ),
-                                  onChanged: (v) {
-                                    _rawEditorDirty =
-                                        true; /* do not auto-apply to model */
-                                  },
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Row(
-                              children: [
-                                Tooltip(message: 'Apply raw JSON to model now'),
-                                ElevatedButton(
-                                  onPressed: _applyRawEditor,
-                                  child: const Text('Apply JSON'),
-                                ),
-                                const SizedBox(width: 8),
-                                Tooltip(
-                                  message: 'Reset JSON editor to model state',
-                                ),
-                                ElevatedButton(
-                                  onPressed: () {
-                                    _setRawEditorFromEditorPath();
-                                    _jsonEditHistory.clear();
-                                    _jsonEditHistory.add(
-                                      _rawEditorController.text,
-                                    );
-                                    _jsonEditIndex = 0;
-                                    _rawEditorDirty = false;
-                                  },
-                                  child: const Text('Reset'),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ],
+                      ),
                     ),
+                    /*const SizedBox(height: 8)*/
+                  ),
+                  // Apply/Reset below the editor as requested
+                  Row(
+                    children: [
+                      Tooltip(message: 'Apply manual JSON changes to model'),
+                      ElevatedButton(
+                        onPressed: _inspectorEditable ? _applyRawEditor : null,
+                        child: const Text('Apply'),
+                      ),
+                      const SizedBox(width: 8),
+                      Tooltip(message: 'Reset inspector JSON to model'),
+                      ElevatedButton(
+                        onPressed: _resetInspectorToEditorPath,
+                        child: const Text('Reset'),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -2116,152 +1911,129 @@ class _BDUIStage2PageState extends State<BDUIStage2Page>
     );
   }
 
-  void _jsonUndo() {
-    if (_jsonEditIndex <= 0) return;
-    _jsonEditIndex--;
-    final txt = _jsonEditHistory[_jsonEditIndex];
-    _setRawEditorTextProgrammatic(txt);
+  // ---------- utility used by many widgets ----------
+  void _setInspectorFromRoot() {
+    _syncInspectorToEditorPath();
   }
 
-  void _jsonRedo() {
-    if (_jsonEditIndex < 0 || _jsonEditIndex >= _jsonEditHistory.length - 1)
-      return;
-    _jsonEditIndex++;
-    final txt = _jsonEditHistory[_jsonEditIndex];
-    _setRawEditorTextProgrammatic(txt);
+  void _setInspectorTextProgrammaticNoHistory(String txt) {
+    final hadFocus = _rawEditorFocus.hasFocus;
+    _rawEditorFocus.canRequestFocus = false;
+    _rawEditorController.text = txt;
+    _rawEditorDirty = false;
+    _rawEditorFocus.canRequestFocus = true;
+    if (hadFocus) _rawEditorFocus.requestFocus();
   }
 
-  void _handleDeleteNode() {
-    if (_editorPath == null) return;
-    _deleteNodeConfirm(_editorPath!);
-  }
+  // alias to match earlier naming
+  //void _setInspectorTextProgrammatic(String txt) => _setInspectorTextProgrammaticNoHistory(txt);
 
-  void _handleDuplicateNode() {
-    if (_editorPath == null) return;
-    _pushHistory();
-    final nav = JsonNavigator(_root);
-    nav.duplicateNode(_editorPath!);
-    setState(() {
-      _setRawEditorFromEditorPath();
-    });
-  }
+  void _setInspectorToEditorPath() => _resetInspectorToEditorPath();
 
-  void _handleRenameNode() {
-    if (_editorPath == null) return;
-    _promptRenameNode(_editorPath!);
-  }
-
-  Future<void> _promptRenameNode(String path) async {
-    final parts = path.split('/');
-    final oldName = parts.isNotEmpty ? parts.last : '';
-    final controller = TextEditingController(text: oldName);
-    final newName = await showDialog<String?>(
-      context: context,
-      builder:
-          (ctx) => AlertDialog(
-            title: const Text('Rename Node'),
-            content: TextField(
-              controller: controller,
-              decoration: const InputDecoration(labelText: 'New name'),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Cancel'),
-              ),
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-                child: const Text('Rename'),
-              ),
-            ],
-          ),
-    );
-    if (newName != null && newName.isNotEmpty && newName != oldName) {
-      final parentPath = _parentPath(path) ?? '';
-      final parent = JsonNavigator(_root).getNode(parentPath);
-      if (parent is Map<String, dynamic>) {
-        if (parent.containsKey(newName)) return _showError('Key exists');
-        final val = parent.remove(oldName);
-        _pushHistory();
-        parent[newName] = val;
-        setState(() {
-          _setRawEditorFromEditorPath();
-        });
-      } else {
-        _showError('Rename target is not a map');
-      }
-    }
-  }
-
-  // ---------- helpers ----------
-  void _showError(String msg) => ScaffoldMessenger.of(
-    context,
-  ).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.red));
-
+  // ---------- UI composition ----------
   @override
   Widget build(BuildContext context) {
+    final leftWidth = (MediaQuery.of(context).size.width * 0.28).clamp(
+      240.0,
+      520.0,
+    );
+    final rightWidth = (MediaQuery.of(context).size.width * 0.34).clamp(
+      280.0,
+      680.0,
+    );
     return Scaffold(
       appBar: AppBar(
         title: const Text('BDUI Builder - Stage2.6'),
         actions: [
-          Tooltip(message: 'Paste BDUI JSON'),
           IconButton(
-            onPressed: _pasteAndLoadJson,
-            icon: const Icon(Icons.paste),
+            onPressed: _pasteAndLoad,
             tooltip: 'Paste JSON',
+            icon: const Icon(Icons.paste),
           ),
-          Tooltip(message: 'Load sample config'),
           IconButton(
             onPressed: _loadSample,
-            icon: const Icon(Icons.playlist_add_check),
             tooltip: 'Load sample',
+            icon: const Icon(Icons.playlist_add_check),
           ),
-          Tooltip(message: 'Copy config to clipboard'),
           IconButton(
             onPressed: _copyToClipboard,
-            icon: const Icon(Icons.copy),
             tooltip: 'Copy',
+            icon: const Icon(Icons.copy),
           ),
-          Tooltip(message: 'Undo'),
           IconButton(
             onPressed: _undo,
-            icon: const Icon(Icons.undo),
             tooltip: 'Undo',
+            icon: const Icon(Icons.undo),
           ),
-          Tooltip(message: 'Redo'),
           IconButton(
             onPressed: _redo,
-            icon: const Icon(Icons.redo),
             tooltip: 'Redo',
+            icon: const Icon(Icons.redo),
           ),
-          if (kIsWeb) Tooltip(message: 'Download JSON'),
           if (kIsWeb)
             IconButton(
-              onPressed: _downloadJsonWeb,
-              icon: const Icon(Icons.download),
+              onPressed: _downloadWeb,
               tooltip: 'Download',
+              icon: const Icon(Icons.download),
             ),
         ],
       ),
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          final maxWidth = constraints.maxWidth;
-          final leftWidth = (maxWidth * 0.26).clamp(240.0, 520.0);
-          final rightWidth = (maxWidth * 0.32).clamp(280.0, 640.0);
-          return Row(
-            children: [
-              ConstrainedBox(
-                constraints: BoxConstraints.tightFor(width: leftWidth),
-                child: _buildSidebar(),
+      body: Row(
+        children: [
+          ConstrainedBox(
+            constraints: BoxConstraints.tightFor(width: leftWidth),
+            child: _buildSidebar(),
+          ),
+          Expanded(
+            child: Container(
+              color: Colors.white,
+              child: Column(
+                children: [
+                  Container(
+                    height: 52,
+                    color: Colors.grey.shade50,
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            child: Text(
+                              'Selected: ${_selectedPath ?? "<none>"}',
+                            ),
+                          ),
+                        ),
+                        TextButton(
+                          onPressed:
+                              () => _showSnack(
+                                'Validation performed (placeholder)',
+                              ),
+                          child: const Text('Validate'),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child:
+                        _editorPath == null
+                            ? const Center(child: Text('Select a node to edit'))
+                            : Padding(
+                              padding: const EdgeInsets.all(8),
+                              child: Column(
+                                children: [
+                                  Expanded(child: _buildVisualInspector()),
+                                ],
+                              ),
+                            ),
+                  ),
+                ],
               ),
-              Expanded(child: _buildCenterEditor()),
-              ConstrainedBox(
-                constraints: BoxConstraints.tightFor(width: rightWidth),
-                child: _buildInspector(),
-              ),
-            ],
-          );
-        },
+            ),
+          ),
+          ConstrainedBox(
+            constraints: BoxConstraints.tightFor(width: rightWidth),
+            child: _buildInspector(),
+          ),
+        ],
       ),
     );
   }
