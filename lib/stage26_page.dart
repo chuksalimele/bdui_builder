@@ -1779,7 +1779,7 @@ class _Stage26PageState extends State<Stage26Page>
         actions: [
           IconButton(
             onPressed: _pasteAndLoad,
-            tooltip: 'Paste JSON',
+            tooltip: 'Load or Paste JSON',
             icon: const Icon(Icons.paste),
           ),
           IconButton(
