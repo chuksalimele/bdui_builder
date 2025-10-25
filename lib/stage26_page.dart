@@ -5,9 +5,13 @@ import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:convert';
 import 'dart:async';
-import 'dart:html' as html;
+import 'package:file_picker/file_picker.dart';
+import 'dart:io';
 import 'json_navigator.dart';
 import 'json_editor_view.dart';
+import 'dart:io' show File; // used for desktop/mobile
+import 'package:flutter/foundation.dart';
+import 'download_nonweb.dart' if (dart.library.html) 'download_web.dart';
 
 class Stage26Page extends StatefulWidget {
   const Stage26Page({super.key});
@@ -135,19 +139,6 @@ class _Stage26PageState extends State<Stage26Page>
     _jsonEditIndex = _jsonEditHistory.length - 1;
   }
 
-  void _jsonEditorUndo() {
-    if (_jsonEditIndex <= 0) return;
-    _jsonEditIndex--;
-    _setInspectorTextProgrammatic(_jsonEditHistory[_jsonEditIndex]);
-  }
-
-  void _jsonEditorRedo() {
-    if (_jsonEditIndex < 0 || _jsonEditIndex >= _jsonEditHistory.length - 1)
-      return;
-    _jsonEditIndex++;
-    _setInspectorTextProgrammatic(_jsonEditHistory[_jsonEditIndex]);
-  }
-
   void _setInspectorTextProgrammatic(String txt) {
     //debugPrint('setInspectorTextProgrammatic');
     final hadFocus = _rawEditorFocus.hasFocus;
@@ -168,16 +159,65 @@ class _Stage26PageState extends State<Stage26Page>
   }
 
   // ---------- IO ----------
+
   Future<String?> _pasteDialog() {
     final ctrl = TextEditingController();
     return showDialog<String?>(
       context: context,
       builder:
           (ctx) => AlertDialog(
-            title: const Text('Paste JSON'),
+            title: const Text('Paste or Load JSON'),
             content: SizedBox(
-              height: 260,
-              child: TextField(controller: ctrl, maxLines: null),
+              height: 280,
+              child: Column(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: ctrl,
+                      maxLines: null,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        hintText: 'Paste JSON here or load from file...',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: ElevatedButton.icon(
+                      icon: const Icon(Icons.folder_open),
+                      label: const Text('Select JSON File'),
+                      onPressed: () async {
+                        final result = await FilePicker.platform.pickFiles(
+                          type: FileType.custom,
+                          allowedExtensions: ['json'],
+                          withData:
+                              true, // ensures bytes are available even if path is null
+                        );
+
+                        if (result != null && result.files.isNotEmpty) {
+                          final file = result.files.single;
+                          String? content;
+
+                          if (!kIsWeb &&
+                              file.path != null &&
+                              file.path!.isNotEmpty) {
+                            // Desktop & mobile
+                            content = await File(file.path!).readAsString();
+                          } else if (kIsWeb && file.bytes != null) {
+                            // Web & sandboxed
+                            content = utf8.decode(file.bytes!);
+                          }
+
+                          if (content != null) {
+                            ctrl.text = content;
+                          }
+                        }
+                      },
+                    ),
+                  ),
+                ],
+              ),
             ),
             actions: [
               TextButton(
@@ -242,21 +282,10 @@ class _Stage26PageState extends State<Stage26Page>
     _showSnack('Copied to clipboard');
   }
 
+  // ===== Cross-platform download method =====
   void _downloadWeb() {
-    if (!kIsWeb) return;
     try {
-      final str = const JsonEncoder.withIndent('  ').convert(_root);
-      final bytes = utf8.encode(str);
-      final blob = html.Blob([bytes]);
-      final url = html.Url.createObjectUrlFromBlob(blob);
-      final a =
-          html.document.createElement('a') as html.AnchorElement
-            ..href = url
-            ..download = 'bdui-config.json';
-      html.document.body?.append(a);
-      a.click();
-      a.remove();
-      html.Url.revokeObjectUrl(url);
+      downloadConfigWeb(_root);
       _showSnack('Download started');
     } catch (e) {
       _showSnack('Download failed: $e');
@@ -1773,12 +1802,12 @@ class _Stage26PageState extends State<Stage26Page>
             tooltip: 'Redo',
             icon: const Icon(Icons.redo),
           ),
-          if (kIsWeb)
-            IconButton(
-              onPressed: _downloadWeb,
-              tooltip: 'Download',
-              icon: const Icon(Icons.download),
-            ),
+
+          IconButton(
+            onPressed: _downloadWeb,
+            tooltip: 'Download',
+            icon: const Icon(Icons.download),
+          ),
         ],
       ),
       body: Row(
