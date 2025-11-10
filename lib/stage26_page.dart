@@ -1580,10 +1580,12 @@ class _Stage26PageState extends State<Stage26Page>
           style: const TextStyle(color: Colors.black),
         ),
       );
+
     return TextSpan(
       style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
       children: spans,
     );
+    
   }
 
   Widget _buildInspector() {
